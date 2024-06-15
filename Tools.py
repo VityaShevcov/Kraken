@@ -23,6 +23,7 @@ class DateTimeSeriesSplit:
         self.test_size = test_size
         self.margin = margin
         self.window = window
+        
 
     def get_n_splits(self) -> int:
         return self.n_splits
@@ -75,6 +76,11 @@ class Kraken:
         self.cv = cv
         self.metric = metric
         self.meta_info_name = meta_info_name
+        
+        # temporary data
+        self.dict_fold_importances = None
+        self.fe_dict = None
+        self.rank_dict = None
 
     def get_rank_dict(self, X: np.ndarray, y: np.ndarray, list_of_vars: List[str], group_dt: Optional[np.ndarray]):
         """
@@ -196,3 +202,11 @@ class Kraken:
         print(vars_in_model)
         print(best_mean_cv)
         return vars_in_model
+    
+    def reset_temp_data(self):
+        """
+        Reset temporary data stored in the class attributes.
+        """
+        self.dict_fold_importances = None
+        self.fe_dict = None
+        self.rank_dict = None
