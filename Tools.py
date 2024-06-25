@@ -8,7 +8,12 @@ import pandas as pd
 class DateTimeSeriesSplit:
     '''Class for creating a time series split for a pandas dataframe with a datetime column'''
 
-    def __init__(self, n_splits: int = 4, test_size: int = 1, margin: int = 1, window: int = 3):
+    def __init__(
+        self, 
+        n_splits: int = 4, 
+        test_size: int = 1, 
+        margin: int = 1, 
+        window: int = 3):
         """
         Initialize DateTimeSeriesSplit class with given n_splits, test_size, margin and window.
         
@@ -28,7 +33,11 @@ class DateTimeSeriesSplit:
     def get_n_splits(self) -> int:
         return self.n_splits
 
-    def split(self, X: pd.DataFrame, y: Optional[Any] = None, groups: pd.DataFrame = None) -> Tuple[np.ndarray, np.ndarray]:
+    def split(
+        self, 
+        X: pd.DataFrame, 
+        y: Optional[Any] = None, 
+        groups: pd.DataFrame = None) -> Tuple[np.ndarray, np.ndarray]:
         """
         _summary_
         
@@ -62,7 +71,12 @@ class Kraken:
     Based on the original idea of Mr. Patekha and proudly implemented in the author's vision
     """
 
-    def __init__(self, estimator: BaseEstimator, cv: BaseCrossValidator, metric: Callable, meta_info_name: str):
+    def __init__(
+        self, 
+        estimator: BaseEstimator, 
+        cv: BaseCrossValidator, 
+        metric: Callable, 
+        meta_info_name: str):
         """
         Initialize Kraken class with given estimator, cross-validator and metric.
         
@@ -82,7 +96,12 @@ class Kraken:
         self.fe_dict = None
         self.rank_dict = None
 
-    def get_rank_dict(self, X: np.ndarray, y: np.ndarray, list_of_vars: List[str], group_dt: Optional[np.ndarray]):
+    def get_rank_dict(
+        self, 
+        X: np.ndarray, 
+        y: np.ndarray, 
+        list_of_vars: List[str], 
+        group_dt: Optional[np.ndarray]):
         """
         Compute SHAP values and create a dictionary with ranked features by their absolute SHAP value.
         
@@ -96,7 +115,7 @@ class Kraken:
             None.
         """
         self.dict_fold_importances = {'Feature': list_of_vars, 'abs_shap': np.zeros(len(list_of_vars))}
-        for fold, (train_idx, val_idx) in enumerate(self.cv.split(X, groups=group_dt), 1):
+        for fold, (train_idx, val_idx) in enumerate(self.cv.split(X, y, groups=group_dt), 1):
             X_train, X_test = X.iloc[train_idx], X.iloc[val_idx]
             y_train, y_test = y.iloc[train_idx], y.iloc[val_idx]
             self.estimator.fit(X_train[list_of_vars], y_train.values)
@@ -107,7 +126,15 @@ class Kraken:
         self.fe_dict = {key: value for key, value in zip(self.dict_fold_importances['Feature'], self.dict_fold_importances['abs_shap'])}
         self.rank_dict = {key: rank for rank, key in enumerate(sorted(self.fe_dict, key=self.fe_dict.get, reverse=True), 1)}
 
-    def get_cross_val_score(self, X: np.ndarray, y: np.ndarray, var: str, old_scores: np.ndarray, selected_vars: Optional[List[str]] = None, group_dt: Optional[np.ndarray] = None, round_num: int = 3):
+    def get_cross_val_score(
+        self, 
+        X: np.ndarray, 
+        y: np.ndarray, 
+        var: str, 
+        old_scores: np.ndarray, 
+        selected_vars: Optional[List[str]] = None, 
+        group_dt: Optional[np.ndarray] = None, 
+        round_num: int = 3):
         """
         Compute cross-validation scores for a given variable.
         
@@ -128,7 +155,7 @@ class Kraken:
         selected_vars.append(var)
         list_scores = []
 
-        for fold, (train_idx, val_idx) in enumerate(self.cv.split(X, groups=group_dt), 1):
+        for fold, (train_idx, val_idx) in enumerate(self.cv.split(X, y, groups=group_dt), 1):
             X_train, X_test = X.iloc[train_idx], X.iloc[val_idx]
             y_train, y_test = y.iloc[train_idx], y.iloc[val_idx]
             self.estimator.fit(X_train[selected_vars], y_train)
@@ -139,7 +166,17 @@ class Kraken:
         mean_cv_score = round(np.mean(fold_scores), round_num)
         return fold_scores, summa, mean_cv_score
 
-    def get_vars(self, X: np.ndarray, y: np.ndarray, early_stopping_rounds: int = 30, summa_approve: int = 1, best_mean_cv: int = 100, vars_in_model: Optional[List] = list(), group_dt: Optional[np.ndarray] = None, round_num: int = 3, old_scores: Optional[np.ndarray] = None):
+    def get_vars(
+        self, 
+        X: np.ndarray, 
+        y: np.ndarray, 
+        early_stopping_rounds: int = 30, 
+        summa_approve: int = 1, 
+        best_mean_cv: int = 10**10, 
+        vars_in_model: Optional[List] = list(), 
+        group_dt: Optional[np.ndarray] = None, 
+        round_num: int = 3, 
+        old_scores: Optional[np.ndarray] = None):
         """
         Select variables based on their SHAP values and cross-validation scores.
         
@@ -149,7 +186,7 @@ class Kraken:
             early_stopping_rounds (int, optional): Number of iterations without improvement to stop the selection.
                 Defaults to 30.
             summa_approve (int, optional): Threshold for the sum of score differences to approve the variable. Defaults to 1.
-            best_mean_cv (int, optional): Threshold for the mean cross-validation score to approve the variable. Defaults to 100.
+            best_mean_cv (int, optional): Threshold for the mean cross-validation score to approve the variable. Defaults to 10**10.
             vars_in_model (List[str], optional): List of initial variables. Defaults to [].
             group_dt (Optional[np.ndarray], optional): Group labels for the samples. Defaults to None.
             round_num (int, optional): Number of decimal places for the scores. Defaults to 3.
@@ -164,7 +201,10 @@ class Kraken:
         while feature_was_added:
             iteration_step = 0
             var_for_add = ''
-            print('начинаем след этап', best_mean_cv)
+            if iteration_step > 0:
+                print('начинаем след этап', best_mean_cv)
+            else:
+                print('запуск первого шага')
             best_positive_groups = summa_approve
             for var in the_list_from_which_we_take_vars:
                 iteration_step += 1
