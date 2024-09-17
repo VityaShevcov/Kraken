@@ -173,7 +173,7 @@ class Kraken:
         early_stopping_rounds: int = 30, 
         summa_approve: int = 1, 
         best_mean_cv: int = 10**10, 
-        vars_in_model: Optional[List] = list(), 
+        vars_in_model: Optional[List] = None,
         group_dt: Optional[np.ndarray] = None, 
         round_num: int = 3, 
         old_scores: Optional[np.ndarray] = None):
@@ -191,6 +191,8 @@ class Kraken:
             group_dt (Optional[np.ndarray], optional): Group labels for the samples. Defaults to None.
             round_num (int, optional): Number of decimal places for the scores. Defaults to 3.
         """
+        if vars_in_model is None:
+            vars_in_model = []
         self.round_num = round_num
         if old_scores == None:
             old_scores = np.array([100 for i in range(self.cv.get_n_splits())])
