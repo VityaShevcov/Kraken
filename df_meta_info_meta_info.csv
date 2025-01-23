@@ -1,4 +1,0 @@
-,vars,summa,mean_cv_scores,cv1,cv2,cv3,cv4,cv5
-0,"['Feature4', 'Feature5', 'Feature2']",5,0.191,0.196,0.165,0.176,0.234,0.182
-0,"['Feature4', 'Feature5', 'Feature2', 'Feature1']",5,0.117,0.111,0.122,0.1,0.151,0.099
-0,"['Feature4', 'Feature5', 'Feature2', 'Feature1', 'Feature3']",5,0.097,0.104,0.105,0.086,0.113,0.079
