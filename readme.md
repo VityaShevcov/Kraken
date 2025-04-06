@@ -33,9 +33,7 @@ Specialized time-series cross-validator that:
   - `margin`: Gap between train and validation
   - `window`: Rolling window size
 
-### Kraken Class Parameters Explained
-
-This section details the parameters for initializing the `Kraken` class.
+### Kraken Class Parameters
 
 *   **`estimator: BaseEstimator`**
     *   **Purpose**: The machine learning model to be used for evaluation.
