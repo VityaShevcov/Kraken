@@ -603,12 +603,13 @@ class Kraken:
         """
         Greedy feature selection based on rank_dict with dynamic status update.
         Limits the search to top_n_for_first_step features on the first step.
+        Adjusted check for max_feature_search_rounds and stopping message.
+        Status line shows only candidates potentially meeting final criteria.
         """
         global_start = time.perf_counter()
         all_features = set(X.columns); rank_dict_features = set(rank_dict.keys())
         missing_features = rank_dict_features - all_features
         if missing_features: raise ValueError(f"Features missing in dataset: {missing_features}")
-        self.rank_dict = rank_dict
         if vars_in_model is None: vars_in_model = []
 
         cv_format_str = f".{self.comparison_precision}f" if self.comparison_precision is not None else ".5f"
@@ -619,11 +620,23 @@ class Kraken:
         starting_from_scratch = ( len(vars_in_model) == 0 and old_scores is None and best_mean_cv is None )
         if old_scores is None or best_mean_cv is None:
             print("[get_vars] Evaluating initial feature set (if any)...")
-            try: old_scores, calc_mean_cv = self.evaluate_current_features(X, y, vars_in_model, group_dt)
-            except TypeError:
-                 print("[get_vars] Warning: evaluate_current_features might need update. Using defaults.")
-                 old_scores, calc_mean_cv = self.evaluate_current_features(X, y, vars_in_model, group_dt)
+            inner_test_size = getattr(self, '_test_size_for_inner_split', 0.2)
+            inner_random_state = getattr(self, '_random_state_for_inner_split', 42)
+            try:
+                old_scores, calc_mean_cv = self.evaluate_current_features(
+                    X, y, vars_in_model, group_dt,
+                    _test_size_for_inner_split=inner_test_size,
+                    _random_state_for_inner_split=inner_random_state
+                )
+            except TypeError as e:
+                 if '_test_size_for_inner_split' in str(e) or '_random_state_for_inner_split' in str(e):
+                     print("[get_vars] Warning: evaluate_current_features might need update for inner split params. Trying without them.")
+                     old_scores, calc_mean_cv = self.evaluate_current_features(X, y, vars_in_model, group_dt)
+                 else:
+                      print(f"[get_vars] Error during initial evaluation: {e}")
+                      raise e
             if best_mean_cv is None: best_mean_cv = calc_mean_cv
+
             if not starting_from_scratch:
                  cv_init_display = "N/A"
                  if pd.notna(best_mean_cv) and np.isfinite(best_mean_cv): cv_init_display = f"{best_mean_cv:{cv_format_str}}"
@@ -642,8 +655,7 @@ class Kraken:
             else: cv_log_display = "Inf"
             print(f"  Initial best_mean_cv: {cv_log_display}")
 
-        # Полный список кандидатов (не выбранные фичи, отсортированные по rank_dict)
-        the_list_from_which_we_take_vars = [f for f in self.rank_dict.keys() if f not in vars_in_model]
+        the_list_from_which_we_take_vars = [f for f in rank_dict.keys() if f not in vars_in_model]
         feature_was_added = True
         df_meta_info = pd.DataFrame()
 
@@ -656,16 +668,12 @@ class Kraken:
             iteration_step = 0
             num_selected_before = len(vars_in_model)
 
-            # --- ОПРЕДЕЛЕНИЕ КАНДИДАТОВ ДЛЯ ШАГА ---
-            if num_selected_before == 0:
-                # Первый шаг: берем топ N
+            if num_selected_before == 0 and top_n_for_first_step is not None and top_n_for_first_step > 0:
                 candidates_this_step = the_list_from_which_we_take_vars[:top_n_for_first_step]
                 print(f"\n--- Starting Step: Selecting feature #{num_selected_before + 1} (Checking top {len(candidates_this_step)}) ---")
             else:
-                # Последующие шаги: берем всех оставшихся
-                candidates_this_step = the_list_from_which_we_take_vars[:] # Копия
+                candidates_this_step = the_list_from_which_we_take_vars[:]
                 print(f"\n--- Starting Step: Selecting feature #{num_selected_before + 1} (Checking {len(candidates_this_step)}) ---")
-            # --- КОНЕЦ ОПРЕДЕЛЕНИЯ КАНДИДАТОВ ---
 
             cv_step_init_display = "N/A"
             if pd.notna(best_mean_cv) and np.isfinite(best_mean_cv): cv_step_init_display = f"{best_mean_cv:{cv_format_str}}"
@@ -673,86 +681,141 @@ class Kraken:
             else: cv_step_init_display = "Inf"
             print(f"    CV Before Step: {cv_step_init_display} | Target Summa Threshold to Add: {self.improvement_threshold}")
 
-            total_candidates_in_step = len(candidates_this_step) # Общее число кандидатов на шаге
+            total_candidates_in_step = len(candidates_this_step)
 
-            # --- Цикл по кандидатам ЭТОГО шага ---
             for var_idx, var in enumerate(candidates_this_step):
+
+                if iteration_step >= max_feature_search_rounds:
+                    print(f"\n[get_vars] Reached step attempt limit ({max_feature_search_rounds} checks without improvement). Stopping search for this step.", flush=True)
+                    break
+
                 iteration_step += 1
 
-                # --- Обновление статусной строки ---
-                cv_display_status = 'N/A'; summa_display_status = 'N/A'
-                if var_for_add:
-                    summa_display_status = str(best_summa_step)
-                    if pd.notna(best_mean_cv_step) and np.isfinite(best_mean_cv_step): cv_display_status = f"{best_mean_cv_step:{cv_format_str}}"
-                    elif pd.isna(best_mean_cv_step): cv_display_status = 'NaN'
-                    else: cv_display_status = 'Inf'
-                # Используем total_candidates_in_step
-                status_line = ( f"\rStep {num_selected_before + 1} | Checks: {iteration_step}/{max_feature_search_rounds} | "
-                    f"Checking [{var_idx+1}/{total_candidates_in_step}]: {var:<20} | "
-                    f"Best Add (this step): {var_for_add if var_for_add else 'None':<20} (Summa: {summa_display_status}, CV: {cv_display_status})" )
+                display_var = 'None'
+                display_summa = 'N/A'
+                display_cv = 'N/A'
+
+                if var_for_add != '':
+                    initial_cv_for_step = best_mean_cv
+                    best_cv_step_finite = best_mean_cv_step
+                    if pd.isna(best_cv_step_finite) or not np.isfinite(best_cv_step_finite):
+                         best_cv_step_finite = -np.inf if self.greater_is_better else np.inf
+
+                    initial_cv_finite = initial_cv_for_step
+                    if pd.isna(initial_cv_finite) or not np.isfinite(initial_cv_finite):
+                         initial_cv_finite = -np.inf if self.greater_is_better else np.inf
+
+                    is_equal_to_start_cv = np.isclose(best_cv_step_finite, initial_cv_finite, atol=tolerance)
+                    meets_final_criteria = False
+                    if self.greater_is_better:
+                        meets_final_criteria = (best_cv_step_finite > initial_cv_finite and not is_equal_to_start_cv) or \
+                                               (is_equal_to_start_cv and best_summa_step >= self.improvement_threshold)
+                    else:
+                        meets_final_criteria = (best_cv_step_finite < initial_cv_finite and not is_equal_to_start_cv) or \
+                                               (is_equal_to_start_cv and best_summa_step >= self.improvement_threshold)
+
+                    if meets_final_criteria:
+                        display_var = var_for_add
+                        display_summa = str(best_summa_step)
+                        if pd.notna(best_mean_cv_step) and np.isfinite(best_mean_cv_step):
+                            display_cv = f"{best_mean_cv_step:{cv_format_str}}"
+                        elif pd.isna(best_mean_cv_step):
+                            display_cv = 'NaN'
+                        else:
+                            display_cv = 'Inf'
+
+                status_line = ( f"\rStep {num_selected_before + 1} | Checks since last best: {iteration_step}/{max_feature_search_rounds} | "
+                    f"Checking cand. [{var_idx+1}/{total_candidates_in_step}]: {var:<20} | "
+                    f"Best valid cand. (step): {display_var:<20} (Summa: {display_summa}, CV: {display_cv})" )
                 try: term_width = os.get_terminal_size().columns
                 except OSError: term_width = 120
                 print(status_line.ljust(term_width), end='', flush=True)
-                # --- Конец статусной строки ---
-
-                if iteration_step > max_feature_search_rounds:
-                    print(f"\n[get_vars] Reached step attempt limit: {max_feature_search_rounds}. Stopping search for this step.", flush=True); break
 
                 selected_vars_copy = vars_in_model.copy()
-                try: fold_scores, summa, mean_cv_score = self.get_cross_val_score( X=X, y=y, var=var, old_scores=old_scores,
-                        selected_vars=selected_vars_copy, group_dt=group_dt, verbose=False )
-                except TypeError:
-                     print(f"\n[!] Warning: get_cross_val_score needs update? Using defaults for '{var}'.", flush=True)
-                     fold_scores, summa, mean_cv_score = self.get_cross_val_score( X=X, y=y, var=var, old_scores=old_scores,
-                        selected_vars=selected_vars_copy, group_dt=group_dt )
+                inner_test_size_cv = getattr(self, '_test_size_for_inner_split', 0.2)
+                inner_random_state_cv = getattr(self, '_random_state_for_inner_split', 42)
+                try:
+                     fold_scores, summa, mean_cv_score = self.get_cross_val_score(
+                         X=X, y=y, var=var, old_scores=old_scores,
+                         selected_vars=selected_vars_copy, group_dt=group_dt,
+                         _test_size_for_inner_split=inner_test_size_cv,
+                         _random_state_for_inner_split=inner_random_state_cv,
+                         verbose=False
+                     )
+                except TypeError as e_cv:
+                     if '_test_size_for_inner_split' in str(e_cv) or '_random_state_for_inner_split' in str(e_cv):
+                         print(f"\n[!] Warning: get_cross_val_score needs update for inner split params? Trying without them for '{var}'.", flush=True)
+                         fold_scores, summa, mean_cv_score = self.get_cross_val_score(
+                             X=X, y=y, var=var, old_scores=old_scores,
+                             selected_vars=selected_vars_copy, group_dt=group_dt, verbose=False
+                         )
+                     else:
+                          print(f"\n[!] ERROR calling get_cross_val_score for '{var}': {e_cv}", flush=True)
+                          del selected_vars_copy; gc.collect(); continue
 
                 if pd.isna(mean_cv_score):
-                    print(f"\n[!] Warning: CV score calculation failed for '{var}'. Skipping.", flush=True)
+                    print(f"\n[!] Warning: CV score calculation returned NaN for '{var}'. Skipping.", flush=True)
                     del fold_scores, summa, mean_cv_score, selected_vars_copy; gc.collect(); continue
 
-                # Сравнение с лучшим кандидатом шага
-                compare_cv_step = best_mean_cv_step
-                if pd.isna(compare_cv_step) or not np.isfinite(compare_cv_step): compare_cv_step = -np.inf if self.greater_is_better else np.inf
-                is_equal_cv_step = np.isclose(mean_cv_score, compare_cv_step, atol=tolerance)
+                compare_cv_step = np.nan
+                if var_for_add:
+                     compare_cv_step = best_mean_cv_step
+
+                current_mean_cv_finite = mean_cv_score
+                if pd.isna(current_mean_cv_finite) or not np.isfinite(current_mean_cv_finite):
+                     current_mean_cv_finite = -np.inf if self.greater_is_better else np.inf
+
+                compare_cv_step_finite = compare_cv_step
+                if pd.isna(compare_cv_step_finite) or not np.isfinite(compare_cv_step_finite):
+                    compare_cv_step_finite = -np.inf if self.greater_is_better else np.inf
+
+                is_equal_cv_step = np.isclose(current_mean_cv_finite, compare_cv_step_finite, atol=tolerance)
                 condition_met_step = False
                 if self.greater_is_better:
-                    is_better_cv_step = mean_cv_score > compare_cv_step and not is_equal_cv_step
-                    is_better_summa_step = summa > best_summa_step
+                    is_better_cv_step = current_mean_cv_finite > compare_cv_step_finite and not is_equal_cv_step
+                    is_better_summa_step = summa > best_summa_step if current_mean_cv_finite >= compare_cv_step_finite else False
                     condition_met_step = is_better_cv_step or (is_equal_cv_step and is_better_summa_step)
                 else:
-                    is_better_cv_step = mean_cv_score < compare_cv_step and not is_equal_cv_step
-                    is_better_summa_step = summa > best_summa_step
+                    is_better_cv_step = current_mean_cv_finite < compare_cv_step_finite and not is_equal_cv_step
+                    is_better_summa_step = summa > best_summa_step if current_mean_cv_finite <= compare_cv_step_finite else False
                     condition_met_step = is_better_cv_step or (is_equal_cv_step and is_better_summa_step)
 
                 if condition_met_step:
-                    best_summa_step = summa; best_mean_cv_step = mean_cv_score
-                    current_best_fold_scores_step = fold_scores; var_for_add = var; iteration_step = 0
+                    best_summa_step = summa
+                    best_mean_cv_step = mean_cv_score
+                    current_best_fold_scores_step = fold_scores
+                    var_for_add = var
+                    iteration_step = 0
                 del fold_scores, summa, mean_cv_score, selected_vars_copy; gc.collect()
-            # --- Конец цикла по кандидатам ---
             print()
 
             round_end = time.perf_counter()
             print(f"--- Step finished in {round_end - round_start:.2f} seconds ---")
 
-            # --- Решение о добавлении лучшего кандидата ---
             improvement_confirmed = False
             if var_for_add != '':
                 initial_cv_for_step = best_mean_cv
-                if pd.isna(initial_cv_for_step) or not np.isfinite(initial_cv_for_step):
-                     initial_cv_for_step = -np.inf if self.greater_is_better else np.inf
-                is_equal_to_start_cv = np.isclose(best_mean_cv_step, initial_cv_for_step, atol=tolerance)
+                best_cv_step_finite = best_mean_cv_step
+                if pd.isna(best_cv_step_finite) or not np.isfinite(best_cv_step_finite):
+                     best_cv_step_finite = -np.inf if self.greater_is_better else np.inf
+
+                initial_cv_finite = initial_cv_for_step
+                if pd.isna(initial_cv_finite) or not np.isfinite(initial_cv_finite):
+                     initial_cv_finite = -np.inf if self.greater_is_better else np.inf
+
+                is_equal_to_start_cv = np.isclose(best_cv_step_finite, initial_cv_finite, atol=tolerance)
                 if self.greater_is_better:
-                    improvement_confirmed = (best_mean_cv_step > initial_cv_for_step and not is_equal_to_start_cv) or \
+                    improvement_confirmed = (best_cv_step_finite > initial_cv_finite and not is_equal_to_start_cv) or \
                                             (is_equal_to_start_cv and best_summa_step >= self.improvement_threshold)
                 else:
-                    improvement_confirmed = (best_mean_cv_step < initial_cv_for_step and not is_equal_to_start_cv) or \
+                    improvement_confirmed = (best_cv_step_finite < initial_cv_finite and not is_equal_to_start_cv) or \
                                             (is_equal_to_start_cv and best_summa_step >= self.improvement_threshold)
-            # --- Конец проверки на добавление ---
 
             if var_for_add != '' and improvement_confirmed:
                 vars_in_model.append(var_for_add)
-                the_list_from_which_we_take_vars.remove(var_for_add) # Удаляем из ОСНОВНОГО списка
-                old_scores = current_best_fold_scores_step; best_mean_cv = best_mean_cv_step
+                the_list_from_which_we_take_vars.remove(var_for_add)
+                old_scores = current_best_fold_scores_step
+                best_mean_cv = best_mean_cv_step
                 print(f"[+] Feature Added: '{var_for_add}'")
                 cv_added_display = "N/A"
                 if pd.notna(best_mean_cv) and np.isfinite(best_mean_cv): cv_added_display = f"{best_mean_cv:{cv_format_str}}"
@@ -760,36 +823,31 @@ class Kraken:
                 else: cv_added_display = "Inf"
                 print(f"    New Best Mean CV: {cv_added_display} (Achieved Summa: {best_summa_step})")
                 print(f"    Selected Features ({len(vars_in_model)}): {vars_in_model}")
-
-                # Логирование
-                def r(x): return round(x, self.comparison_precision) if self.comparison_precision is not None and pd.notna(x) and np.isfinite(x) else x
-                best_mean_cv_for_csv = r(best_mean_cv) if pd.notna(best_mean_cv) and np.isfinite(best_mean_cv) else best_mean_cv
-                list_meta = ( ['vars_list'] + [best_summa_step] + [best_mean_cv_for_csv] + [r(s) for s in old_scores] )
+                def r(x):
+                    if self.comparison_precision is not None and pd.notna(x) and np.isfinite(x):
+                        return round(x, self.comparison_precision)
+                    return x
+                best_mean_cv_for_csv = r(best_mean_cv)
+                fold_scores_for_csv = [r(s) for s in old_scores] if old_scores is not None else []
+                list_meta = ( [vars_in_model.copy()] + [best_summa_step] + [best_mean_cv_for_csv] + fold_scores_for_csv )
                 df_meta = pd.DataFrame([list_meta])
-                n_splits_meta = len(old_scores) if old_scores is not None and len(old_scores) > 0 else self.cv.get_n_splits()
+                n_splits_meta = len(old_scores) if old_scores is not None and len(old_scores) > 0 else 0
+                if n_splits_meta == 0:
+                     try: n_splits_meta = self.cv.get_n_splits(X, y, group_dt) if hasattr(self.cv, 'get_n_splits') else self.cv.get_n_splits()
+                     except: n_splits_meta = 0
                 df_meta.columns = ( ['vars', 'summa', 'mean_cv_scores'] + [f'cv{i}' for i in range(1, n_splits_meta + 1)] )
-                df_meta.at[0, 'vars'] = vars_in_model.copy()
                 df_meta_info = pd.concat([df_meta_info, df_meta], ignore_index=True)
                 try:
                     df_meta_info.to_csv(f'df_meta_info_{self.meta_info_name}.csv', index=False)
                     print(f"    Meta info saved to df_meta_info_{self.meta_info_name}.csv")
                 except Exception as e: print(f"[!] Error saving meta info: {e}")
-
                 del df_meta;
                 if 'current_best_fold_scores_step' in locals(): del current_best_fold_scores_step
                 gc.collect(); feature_was_added = True
             else:
-                if var_for_add != '':
-                     cv_initial_display = "N/A"
-                     if pd.notna(best_mean_cv) and np.isfinite(best_mean_cv): cv_initial_display = f"{best_mean_cv:{cv_format_str}}"
-                     elif pd.isna(best_mean_cv): cv_initial_display = "NaN"
-                     else: cv_initial_display = "Inf"
-                     print(f"[-] Best candidate '{var_for_add}' (CV: {best_mean_cv_step:{cv_format_str}}, Summa: {best_summa_step}) did not improve score vs previous step (CV: {cv_initial_display}, Threshold: {self.improvement_threshold}). Stopping.")
-                else:
-                     print("[-] No feature found that improves the score in this step. Stopping.")
+                print("[-] No feature found that improves the score in this step. Stopping.")
                 feature_was_added = False
 
-        # --- Конец основного цикла while ---
         print("-" * 30)
         print('[get_vars] Final feature set:')
         print(f"  Features ({len(vars_in_model)}): {vars_in_model}")
