@@ -1,5 +1,5 @@
 # Kraken
-Automated feature selection tool for time-series machine learning tasks
+Automated feature selection tool for machine learning tasks
 
 ## Description
 Kraken is a greedy feature selection tool designed for temporal data that:
