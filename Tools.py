@@ -729,36 +729,19 @@ class Kraken:
                 display_cv = 'N/A'
 
                 if var_for_add != '':
-                    initial_cv_for_step = best_mean_cv
-                    best_cv_step_finite = best_mean_cv_step
-                    if pd.isna(best_cv_step_finite) or not np.isfinite(best_cv_step_finite):
-                         best_cv_step_finite = -np.inf if self.greater_is_better else np.inf
-
-                    initial_cv_finite = initial_cv_for_step
-                    if pd.isna(initial_cv_finite) or not np.isfinite(initial_cv_finite):
-                         initial_cv_finite = -np.inf if self.greater_is_better else np.inf
-
-                    is_equal_to_start_cv = np.isclose(best_cv_step_finite, initial_cv_finite, atol=tolerance)
-                    meets_final_criteria = False
-                    if self.greater_is_better:
-                        meets_final_criteria = (best_cv_step_finite > initial_cv_finite and not is_equal_to_start_cv) or \
-                                               (is_equal_to_start_cv and best_summa_step >= self.improvement_threshold)
-                    else:
-                        meets_final_criteria = (best_cv_step_finite < initial_cv_finite and not is_equal_to_start_cv) or \
-                                               (is_equal_to_start_cv and best_summa_step >= self.improvement_threshold)
-
-                    if meets_final_criteria:
+                    # --- ИЗМЕНЕНИЕ: Отображаем лучшего кандидата, только если его summa >= 0 --- 
+                    if best_summa_step >= 0: 
                         display_var = var_for_add
                         display_summa = str(best_summa_step)
                         if pd.notna(best_mean_cv_step) and np.isfinite(best_mean_cv_step):
-                            # --- ИЗМЕНЕНИЕ: Используем cv_display_width для выравнивания --- 
                             formatted_cv = f"{best_mean_cv_step:{cv_format_str}}"
                             display_cv = formatted_cv.ljust(cv_display_width)
-                            # --- КОНЕЦ ИЗМЕНЕНИЯ --- 
                         elif pd.isna(best_mean_cv_step):
                             display_cv = 'NaN'.ljust(cv_display_width)
                         else:
                             display_cv = 'Inf'.ljust(cv_display_width)
+                    # Если лучший кандидат имеет summa < 0, то поля display_* остаются 'None'/'N/A'
+                    # --- КОНЕЦ ИЗМЕНЕНИЯ --- 
 
                 # --- ИЗМЕНЕНИЕ: Используем max_feature_name_length и ширину счетчиков для выравнивания --- 
                 status_line = ( f"\rStep {num_selected_before + 1} | Checks since last best: {iteration_step:0{checks_width}d}/{max_feature_search_rounds:0{checks_width}d} | "
@@ -808,15 +791,27 @@ class Kraken:
                     compare_cv_step_finite = -np.inf if self.greater_is_better else np.inf
 
                 is_equal_cv_step = np.isclose(current_mean_cv_finite, compare_cv_step_finite, atol=tolerance)
+                
+                # --- ИЗМЕНЕНИЕ: Уточненный приоритет summa и CV --- 
                 condition_met_step = False
+                is_better_summa = summa > best_summa_step
+                is_equal_summa = summa == best_summa_step
+                
                 if self.greater_is_better:
-                    is_better_cv_step = current_mean_cv_finite > compare_cv_step_finite and not is_equal_cv_step
-                    is_better_summa_step = summa > best_summa_step if current_mean_cv_finite >= compare_cv_step_finite else False
-                    condition_met_step = is_better_cv_step or (is_equal_cv_step and is_better_summa_step)
-                else:
-                    is_better_cv_step = current_mean_cv_finite < compare_cv_step_finite and not is_equal_cv_step
-                    is_better_summa_step = summa > best_summa_step if current_mean_cv_finite <= compare_cv_step_finite else False
-                    condition_met_step = is_better_cv_step or (is_equal_cv_step and is_better_summa_step)
+                    is_strictly_better_cv = current_mean_cv_finite > compare_cv_step_finite and not is_equal_cv_step
+                    # CV не хуже (лучше или равен)
+                    is_not_worse_cv = current_mean_cv_finite >= compare_cv_step_finite 
+                    # Условие: (summa лучше И CV не хуже) ИЛИ (summa равна И CV строго лучше)
+                    condition_met_step = (is_better_summa and is_not_worse_cv) or \
+                                         (is_equal_summa and is_strictly_better_cv)
+                else: # lower is better
+                    is_strictly_better_cv = current_mean_cv_finite < compare_cv_step_finite and not is_equal_cv_step
+                    # CV не хуже (лучше или равен)
+                    is_not_worse_cv = current_mean_cv_finite <= compare_cv_step_finite
+                    # Условие: (summa лучше И CV не хуже) ИЛИ (summa равна И CV строго лучше)
+                    condition_met_step = (is_better_summa and is_not_worse_cv) or \
+                                         (is_equal_summa and is_strictly_better_cv)
+                # --- КОНЕЦ ИЗМЕНЕНИЯ --- 
 
                 if condition_met_step:
                     best_summa_step = summa

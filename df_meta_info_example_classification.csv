@@ -1,5 +1,5 @@
 vars,summa,mean_cv_scores,cv1,cv2,cv3
-['echoes_from_abyss'],3,0.752,0.749,0.734,0.773
-"['echoes_from_abyss', 'shadow_of_the_north']",3,0.8,0.8,0.781,0.819
-"['echoes_from_abyss', 'shadow_of_the_north', 'moonlight_whisper']",3,0.831,0.832,0.818,0.843
-"['echoes_from_abyss', 'shadow_of_the_north', 'moonlight_whisper', 'phoenix_feather_5_lost']",3,0.834,0.833,0.821,0.848
+['moonlight_whisper'],3,0.616,0.638,0.635,0.576
+"['moonlight_whisper', 'echoes_from_abyss']",3,0.658,0.668,0.679,0.627
+"['moonlight_whisper', 'echoes_from_abyss', 'shadow_of_the_north']",3,0.69,0.689,0.705,0.676
+"['moonlight_whisper', 'echoes_from_abyss', 'shadow_of_the_north', 'werewolf_fang_15_lost']",1,0.693,0.693,0.712,0.675
