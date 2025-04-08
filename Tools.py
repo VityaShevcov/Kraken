@@ -486,6 +486,12 @@ class Kraken:
             fold_end = time.perf_counter()
             if verbose: print(f"[get_cross_val_score] Fold {fold} for '{var}' processed in {fold_end - fold_start:.2f} seconds.")
 
+        # --- ИСПРАВЛЕНИЕ: дополняем list_scores до полной длины n_splits ---
+        if len(list_scores) < n_splits:
+            if verbose: print(f"[get_cross_val_score] Дополняем массив скоров для '{var}': {len(list_scores)} → {n_splits}")
+            list_scores.extend([np.nan] * (n_splits - len(list_scores)))
+        # --- КОНЕЦ ИСПРАВЛЕНИЯ ---
+            
         fold_scores_np = np.array(list_scores)
         mean_cv_score = np.nanmean(fold_scores_np) if len(fold_scores_np) > 0 else np.nan
         summa = improvements - worsenings
@@ -616,6 +622,11 @@ class Kraken:
         log_format_str = f".{self.comparison_precision}f" if self.comparison_precision is not None else ""
         tolerance = 10**(-(self.comparison_precision + 1)) if self.comparison_precision is not None else 1e-9
 
+        # --- ИЗМЕНЕНИЕ: Рассчитываем максимальную длину имени фичи для выравнивания --- 
+        all_candidate_features = list(rank_dict.keys())
+        max_feature_name_length = max(len(f) for f in all_candidate_features) if all_candidate_features else 20 # Запасной вариант, если список пуст
+        # --- КОНЕЦ ИЗМЕНЕНИЯ ---
+
         # Evaluate initial scores if not provided
         starting_from_scratch = ( len(vars_in_model) == 0 and old_scores is None and best_mean_cv is None )
         if old_scores is None or best_mean_cv is None:
@@ -643,6 +654,24 @@ class Kraken:
                  elif pd.isna(best_mean_cv): cv_init_display = "NaN"
                  else: cv_init_display = "Inf"
                  print(f"[get_vars] Initial evaluation complete. Best CV: {cv_init_display}")
+        
+        # --- ИЗМЕНЕНИЕ: Расчет ширины для отображения CV --- 
+        cv_display_width = 10 # Ширина по умолчанию
+        ref_score_for_width = np.nan
+        # Используем baseline score если он валидный, иначе начальный best_mean_cv
+        if hasattr(self, 'baseline_mean_cv_all_features') and pd.notna(self.baseline_mean_cv_all_features) and np.isfinite(self.baseline_mean_cv_all_features):
+            ref_score_for_width = self.baseline_mean_cv_all_features
+        elif best_mean_cv is not None and pd.notna(best_mean_cv) and np.isfinite(best_mean_cv):
+             ref_score_for_width = best_mean_cv
+        
+        if pd.notna(ref_score_for_width):
+            formatted_ref_cv = f"{ref_score_for_width:.{self.comparison_precision}f}"
+            # Рассчитываем ширину на основе отформатированного референсного значения, но не менее ширины "-Inf"
+            cv_display_width = max(len(formatted_ref_cv), len("-Inf"))
+        else:
+            # Если референсного значения нет, используем ширину, достаточную для "-Inf" или "NaN" + запас
+            cv_display_width = max(len("-Inf"), len("NaN"), 5 + self.comparison_precision if self.comparison_precision is not None else 10)
+        # --- КОНЕЦ ИЗМЕНЕНИЯ ---
 
         print("[get_vars] Starting feature selection procedure...")
         if starting_from_scratch: print(f"[get_vars] Starting from scratch (will check top {top_n_for_first_step} features first).")
@@ -682,6 +711,10 @@ class Kraken:
             print(f"    CV Before Step: {cv_step_init_display} | Target Summa Threshold to Add: {self.improvement_threshold}")
 
             total_candidates_in_step = len(candidates_this_step)
+            # --- ИЗМЕНЕНИЕ: Рассчитываем ширину для счетчиков --- 
+            checks_width = len(str(max_feature_search_rounds))
+            candidate_index_width = len(str(total_candidates_in_step))
+            # --- КОНЕЦ ИЗМЕНЕНИЯ ---
 
             for var_idx, var in enumerate(candidates_this_step):
 
@@ -718,15 +751,20 @@ class Kraken:
                         display_var = var_for_add
                         display_summa = str(best_summa_step)
                         if pd.notna(best_mean_cv_step) and np.isfinite(best_mean_cv_step):
-                            display_cv = f"{best_mean_cv_step:{cv_format_str}}"
+                            # --- ИЗМЕНЕНИЕ: Используем cv_display_width для выравнивания --- 
+                            formatted_cv = f"{best_mean_cv_step:{cv_format_str}}"
+                            display_cv = formatted_cv.ljust(cv_display_width)
+                            # --- КОНЕЦ ИЗМЕНЕНИЯ --- 
                         elif pd.isna(best_mean_cv_step):
-                            display_cv = 'NaN'
+                            display_cv = 'NaN'.ljust(cv_display_width)
                         else:
-                            display_cv = 'Inf'
+                            display_cv = 'Inf'.ljust(cv_display_width)
 
-                status_line = ( f"\rStep {num_selected_before + 1} | Checks since last best: {iteration_step}/{max_feature_search_rounds} | "
-                    f"Checking cand. [{var_idx+1}/{total_candidates_in_step}]: {var:<20} | "
-                    f"Best valid cand. (step): {display_var:<20} (Summa: {display_summa}, CV: {display_cv})" )
+                # --- ИЗМЕНЕНИЕ: Используем max_feature_name_length и ширину счетчиков для выравнивания --- 
+                status_line = ( f"\rStep {num_selected_before + 1} | Checks since last best: {iteration_step:0{checks_width}d}/{max_feature_search_rounds:0{checks_width}d} | "
+                    f"Checking cand. [{var_idx+1:0{candidate_index_width}d}/{total_candidates_in_step:0{candidate_index_width}d}]: {var:<{max_feature_name_length}} | "
+                    f"Best valid cand. (step): {display_var:<{max_feature_name_length}} (Summa: {display_summa}, CV: {display_cv})" )
+                # --- КОНЕЦ ИЗМЕНЕНИЯ --- 
                 try: term_width = os.get_terminal_size().columns
                 except OSError: term_width = 120
                 print(status_line.ljust(term_width), end='', flush=True)
@@ -804,12 +842,17 @@ class Kraken:
                      initial_cv_finite = -np.inf if self.greater_is_better else np.inf
 
                 is_equal_to_start_cv = np.isclose(best_cv_step_finite, initial_cv_finite, atol=tolerance)
+                
+                # --- ИСПРАВЛЕНИЕ: всегда требуем summa >= improvement_threshold ---
                 if self.greater_is_better:
-                    improvement_confirmed = (best_cv_step_finite > initial_cv_finite and not is_equal_to_start_cv) or \
-                                            (is_equal_to_start_cv and best_summa_step >= self.improvement_threshold)
+                    improvement_confirmed = best_summa_step >= self.improvement_threshold and (
+                        (best_cv_step_finite > initial_cv_finite and not is_equal_to_start_cv) or is_equal_to_start_cv
+                    )
                 else:
-                    improvement_confirmed = (best_cv_step_finite < initial_cv_finite and not is_equal_to_start_cv) or \
-                                            (is_equal_to_start_cv and best_summa_step >= self.improvement_threshold)
+                    improvement_confirmed = best_summa_step >= self.improvement_threshold and (
+                        (best_cv_step_finite < initial_cv_finite and not is_equal_to_start_cv) or is_equal_to_start_cv
+                    )
+                # --- КОНЕЦ ИСПРАВЛЕНИЯ ---
 
             if var_for_add != '' and improvement_confirmed:
                 vars_in_model.append(var_for_add)
