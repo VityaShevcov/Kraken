@@ -21,19 +21,9 @@ Kraken is a greedy feature selection tool designed for temporal data that:
 - Support for categorical features
 - Early stopping mechanism
 
-## Core Components
+Kraken relies on the configuration provided during initialization, particularly the estimator, cross-validator, and metric.
 
-### DateTimeSeriesSplit
-Specialized time-series cross-validator that:
-- Maintains temporal order of data
-- Prevents forward-looking bias
-- Configurable with:
-  - `n_splits`: Number of folds
-  - `test_size`: Out-of-sample period length 
-  - `margin`: Gap between train and validation
-  - `window`: Rolling window size
-
-### Kraken Class Parameters
+## Kraken Class Parameters
 
 *   **`estimator: BaseEstimator`**
     *   **Purpose**: The machine learning model to be used for evaluation.
@@ -42,8 +32,13 @@ Specialized time-series cross-validator that:
 
 *   **`cv: BaseCrossValidator`**
     *   **Purpose**: The cross-validation strategy to split the data. Crucial for time-series to prevent lookahead bias.
-    *   **Recommendation**: Use the provided `DateTimeSeriesSplit` for time-aware splitting, or provide any scikit-learn compatible cross-validator.
-    *   **Example**: `DateTimeSeriesSplit(n_splits=5, test_size=30, window=90, margin=7)`, `TimeSeriesSplit(n_splits=5)`
+    *   **Requirements**: Any scikit-learn compatible cross-validator object.
+    *   **Recommendation for Time Series**: For temporal data, using a time-aware splitter is highly recommended to maintain data order and prevent leakage. The library includes `DateTimeSeriesSplit` for this purpose:
+        *   **`DateTimeSeriesSplit`**: A specialized time-series cross-validator included with Kraken that:
+            *   Maintains temporal order of data.
+            *   Prevents forward-looking bias.
+            *   Is configurable with `n_splits`, `test_size` (length of the validation period), `margin` (gap between train and validation), and `window` (rolling training window size).
+    *   **Examples**: `DateTimeSeriesSplit(n_splits=5, test_size=30, window=90, margin=7)`, `TimeSeriesSplit(n_splits=5)`, `KFold(n_splits=5, shuffle=True, random_state=42)` (for non-temporal data)
 
 *   **`metric: Callable`**
     *   **Purpose**: The function used to evaluate the model's performance on each fold.
