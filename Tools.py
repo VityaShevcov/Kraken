@@ -65,12 +65,23 @@ class DateTimeSeriesSplit:
         Yields:
             Iterator[Tuple[np.ndarray, np.ndarray]]: train and test ordinal number
         """
-        unique_dates = sorted(groups.unique())
-        rank_dates = {date: rank for rank, date in enumerate(unique_dates)}
-        
-        # Add auxiliary column
-        X['index_time'] = groups.map(rank_dates)
-        X = X.reset_index(drop=True)
+        pd.options.mode.chained_assignment = None
+        try:
+            if 'index_time' not in X.columns:
+                 unique_dates = sorted(groups.unique())
+                 rank_dates = {date: rank for rank, date in enumerate(unique_dates)}
+                 X['index_time'] = groups.map(rank_dates)
+            else:
+                 unique_dates = sorted(groups.unique())
+                 rank_dates = {date: rank for rank, date in enumerate(unique_dates)}
+                 X['index_time'] = groups.map(rank_dates)
+
+        except Exception as e:
+             print(f"[!] DateTimeSeriesSplit.split: Error assigning 'index_time': {e}")
+        finally:
+            pd.options.mode.chained_assignment = 'warn'
+
+        X_reset = X.reset_index(drop=True)
         index_time_list = list(rank_dates.values())
 
         for i in reversed(range(1, self.n_splits + 1)):
@@ -82,11 +93,11 @@ class DateTimeSeriesSplit:
             left_test = index_time_list[-1] - i * self.test_size + 1
             right_test = index_time_list[-1] - (i - 1) * self.test_size + 1
 
-            index_test = X.index.get_indexer(
-                X.index[X.index_time.isin(index_time_list[left_test:right_test])]
+            index_test = X_reset.index.get_indexer(
+                X_reset.index[X_reset['index_time'].isin(index_time_list[left_test:right_test])]
             )
-            index_train = X.index.get_indexer(
-                X.index[X.index_time.isin(index_time_list[left_train:right_train])]
+            index_train = X_reset.index.get_indexer(
+                X_reset.index[X_reset['index_time'].isin(index_time_list[left_train:right_train])]
             )
 
             yield index_train, index_test
@@ -167,13 +178,14 @@ class Kraken:
         y: pd.Series,
         list_of_vars: List[str],
         group_dt: Optional[np.ndarray] = None,
+        group_code: Optional[pd.Series] = None,
         shap_estimator: Optional[BaseEstimator] = None,
         test_size_for_inner_split: float = 0.2,
         random_state_for_inner_split: int = 42
     ):
         """
         Calculate SHAP importances and baseline metric on all features across all folds
-        using a dynamic status update line.
+        using a dynamic status update line. Accepts optional group_code for metrics.
         """
         # 1. Check SHAP cache
         if self.cache_importances and os.path.exists(self.importances_cache_path):
@@ -189,7 +201,7 @@ class Kraken:
                     print("[get_rank_dict] Calculating baseline score separately as SHAP is cached...")
                     try:
                         bl_scores, bl_mean = self.evaluate_current_features(
-                            X, y, list_of_vars, group_dt,
+                            X, y, list_of_vars, group_dt, group_code,
                             _test_size_for_inner_split=test_size_for_inner_split,
                             _random_state_for_inner_split=random_state_for_inner_split
                         )
@@ -247,6 +259,9 @@ class Kraken:
             try:
                 X_train, X_test = X.iloc[train_idx], X.iloc[val_idx]
                 y_train, y_test = y.iloc[train_idx], y.iloc[val_idx]
+                # --- Получаем group_code для тестового фолда ---
+                group_code_test = group_code.iloc[val_idx] if group_code is not None else None
+                # ---
                 y_train_transformed = self.forward_transform(y_train.values)
 
                 _update_status(fold, n_splits, "Training model...", fold_start_time, global_start_time)
@@ -283,7 +298,16 @@ class Kraken:
                             else: print(f"\n[!] Warning: Fold {fold} - Unexpected predict_proba shape: {proba.shape}", flush=True)
                         else: y_pred_baseline = model.predict(X_test[list_of_vars])
                     else: y_pred_baseline = model.predict(X_test[list_of_vars])
-                    if y_pred_baseline is not None: score_baseline = self.metric(y_test, y_pred_baseline)
+                    if y_pred_baseline is not None:
+                        try:
+                            # --- ИЗМЕНЕНИЕ: Применяем inverse_transform ---
+                            y_pred_baseline_original_scale = self.inverse_transform(y_pred_baseline)
+                            # --- КОНЕЦ ИЗМЕНЕНИЯ ---
+                            score_baseline = self.metric(y_test, y_pred_baseline_original_scale, group_code=group_code_test)
+                        except TypeError:
+                            # --- ИЗМЕНЕНИЕ: Используем трансформированные обратно предсказания ---
+                            score_baseline = self.metric(y_test, y_pred_baseline_original_scale)
+                            # --- КОНЕЦ ИЗМЕНЕНИЯ ---
                 except Exception as e_bl_fold: print(f"\n[!] ERROR: Fold {fold} - Baseline calculation failed: {e_bl_fold}", flush=True)
                 baseline_fold_scores.append(score_baseline)
                 _update_status(fold, n_splits, "Baseline calculated.", fold_start_time, global_start_time)
@@ -329,6 +353,7 @@ class Kraken:
                 if 'X_test_sampled' in locals(): del X_test_sampled
                 if 'shap_values' in locals(): del shap_values
                 if 'abs_shap_fold' in locals(): del abs_shap_fold
+                del group_code_test
                 gc.collect()
 
             fold_end_time = time.perf_counter()
@@ -375,6 +400,7 @@ class Kraken:
         old_scores: np.ndarray,
         selected_vars: Optional[List[str]] = None,
         group_dt: Optional[np.ndarray] = None,
+        group_code: Optional[pd.Series] = None,
         _test_size_for_inner_split: float = 0.2,
         _random_state_for_inner_split: int = 42,
         verbose: bool = True
@@ -382,6 +408,7 @@ class Kraken:
         """
         Run cross-validation by adding feature var to already selected vars.
         Correctly handles comparison with initial -inf/+inf scores.
+        Accepts optional group_code for metrics.
         """
         start_time = time.perf_counter()
         if verbose: print(f"\n[get_cross_val_score] Starting evaluation for '{var}'...", flush=True)
@@ -402,11 +429,15 @@ class Kraken:
             if verbose: print(f"[get_cross_val_score] Fold {fold} for '{var}'...")
 
             model = None; X_train = None; X_test = None; y_train = None; y_test = None; y_train_transformed = None; y_pred = None
+            group_code_test = None
             score = np.nan # Default score
 
             try:
                 X_train, X_test = X.iloc[train_idx], X.iloc[val_idx]
                 y_train, y_test = y.iloc[train_idx], y.iloc[val_idx]
+                # --- Получаем group_code для тестового фолда ---
+                group_code_test = group_code.iloc[val_idx] if group_code is not None else None
+                # ---
                 current_categorical_features = [col for col in selected_vars if col in self.cat_features]
                 model = self.estimator.__class__(**self.estimator.get_params())
                 if hasattr(model, "set_params"):
@@ -439,12 +470,22 @@ class Kraken:
                 else: y_pred = model.predict(X_test[selected_vars])
 
                 # Calculate metric
-                if y_pred is not None: score = self.metric(y_test, y_pred)
+                if y_pred is not None:
+                    try:
+                        # --- ИЗМЕНЕНИЕ: Применяем inverse_transform ---
+                        y_pred_original_scale = self.inverse_transform(y_pred)
+                        # --- КОНЕЦ ИЗМЕНЕНИЯ ---
+                        score = self.metric(y_test, y_pred_original_scale, group_code=group_code_test)
+                    except TypeError:
+                         # --- ИЗМЕНЕНИЕ: Используем трансформированные обратно предсказания ---
+                        score = self.metric(y_test, y_pred_original_scale)
+                         # --- КОНЕЦ ИЗМЕНЕНИЯ ---
 
             except Exception as e_cv_fold: print(f"\n[!] ERROR: get_cross_val_score Fold {fold} for '{var}': {e_cv_fold}", flush=True)
             finally:
                 del X_train, X_test, y_train, y_test, model, y_pred
                 if 'y_train_transformed' in locals(): del y_train_transformed
+                del group_code_test
                 gc.collect()
 
             list_scores.append(score) # Добавляем score (может быть NaN)
@@ -507,12 +548,13 @@ class Kraken:
         y: pd.Series,
         vars_in_model: List[str],
         group_dt: Optional[np.ndarray] = None,
+        group_code: Optional[pd.Series] = None,
         _test_size_for_inner_split: float = 0.2,
         _random_state_for_inner_split: int = 42
     ):
         """
         Evaluate current feature set vars_in_model.
-        (Updated to accept inner split params for consistency)
+        Accepts optional group_code for metrics.
         """
         try:
             n_splits_eval = self.cv.get_n_splits(X, y, group_dt) if hasattr(self.cv, 'get_n_splits') else 3
@@ -541,6 +583,9 @@ class Kraken:
             try:
                 X_train, X_test = X.iloc[train_idx], X.iloc[val_idx]
                 y_train, y_test = y.iloc[train_idx], y.iloc[val_idx]
+                # --- Получаем group_code для тестового фолда ---
+                group_code_test = group_code.iloc[val_idx] if group_code is not None else None
+                # ---
                 current_categorical_features = [col for col in vars_in_model if col in self.cat_features]
                 model = self.estimator.__class__(**self.estimator.get_params())
                 if hasattr(model, "set_params"):
@@ -579,12 +624,22 @@ class Kraken:
                     y_pred = model.predict(X_test[vars_in_model])
 
                 # Calculate metric
-                if y_pred is not None: score = self.metric(y_test, y_pred)
+                if y_pred is not None:
+                    try:
+                        # --- ИЗМЕНЕНИЕ: Применяем inverse_transform ---
+                        y_pred_original_scale = self.inverse_transform(y_pred)
+                        # --- КОНЕЦ ИЗМЕНЕНИЯ ---
+                        score = self.metric(y_test, y_pred_original_scale, group_code=group_code_test)
+                    except TypeError:
+                         # --- ИЗМЕНЕНИЕ: Используем трансформированные обратно предсказания ---
+                        score = self.metric(y_test, y_pred_original_scale)
+                         # --- КОНЕЦ ИЗМЕНЕНИЯ ---
 
             except Exception as e_eval_fold: print(f"[!] ERROR: evaluate_current_features Fold {fold}: {e_eval_fold}")
             finally:
                 del X_train, X_test, y_train, y_test, model, y_pred
                 if 'y_train_transformed' in locals(): del y_train_transformed
+                del group_code_test
                 gc.collect()
 
             fold_scores.append(score)
@@ -601,6 +656,7 @@ class Kraken:
         rank_dict: dict,
         vars_in_model: Optional[List[str]] = None,
         group_dt: Optional[np.ndarray] = None,
+        group_code: Optional[pd.Series] = None,
         old_scores: Optional[np.ndarray] = None,
         best_mean_cv: Optional[float] = None,
         max_feature_search_rounds: int = 30,
@@ -608,9 +664,7 @@ class Kraken:
     ):
         """
         Greedy feature selection based on rank_dict with dynamic status update.
-        Limits the search to top_n_for_first_step features on the first step.
-        Adjusted check for max_feature_search_rounds and stopping message.
-        Status line shows only candidates potentially meeting final criteria.
+        Accepts optional group_code for metrics.
         """
         global_start = time.perf_counter()
         all_features = set(X.columns); rank_dict_features = set(rank_dict.keys())
@@ -635,13 +689,13 @@ class Kraken:
             inner_random_state = getattr(self, '_random_state_for_inner_split', 42)
             try:
                 old_scores, calc_mean_cv = self.evaluate_current_features(
-                    X, y, vars_in_model, group_dt,
+                    X, y, vars_in_model, group_dt, group_code,
                     _test_size_for_inner_split=inner_test_size,
                     _random_state_for_inner_split=inner_random_state
                 )
             except TypeError as e:
                  if '_test_size_for_inner_split' in str(e) or '_random_state_for_inner_split' in str(e):
-                     print("[get_vars] Warning: evaluate_current_features might need update for inner split params. Trying without them.")
+                     print("[get_vars] Warning: evaluate_current_features might need update for inner split params or group_code. Trying without them.")
                      old_scores, calc_mean_cv = self.evaluate_current_features(X, y, vars_in_model, group_dt)
                  else:
                       print(f"[get_vars] Error during initial evaluation: {e}")
@@ -759,13 +813,14 @@ class Kraken:
                      fold_scores, summa, mean_cv_score = self.get_cross_val_score(
                          X=X, y=y, var=var, old_scores=old_scores,
                          selected_vars=selected_vars_copy, group_dt=group_dt,
+                         group_code=group_code,
                          _test_size_for_inner_split=inner_test_size_cv,
                          _random_state_for_inner_split=inner_random_state_cv,
                          verbose=False
                      )
                 except TypeError as e_cv:
                      if '_test_size_for_inner_split' in str(e_cv) or '_random_state_for_inner_split' in str(e_cv):
-                         print(f"\n[!] Warning: get_cross_val_score needs update for inner split params? Trying without them for '{var}'.", flush=True)
+                         print(f"\n[!] Warning: get_cross_val_score needs update for inner split params or group_code? Trying without them for '{var}'.", flush=True)
                          fold_scores, summa, mean_cv_score = self.get_cross_val_score(
                              X=X, y=y, var=var, old_scores=old_scores,
                              selected_vars=selected_vars_copy, group_dt=group_dt, verbose=False
