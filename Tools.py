@@ -676,10 +676,17 @@ class Kraken:
         log_format_str = f".{self.comparison_precision}f" if self.comparison_precision is not None else ""
         tolerance = 10**(-(self.comparison_precision + 1)) if self.comparison_precision is not None else 1e-9
 
-        # --- ИЗМЕНЕНИЕ: Рассчитываем максимальную длину имени фичи для выравнивания --- 
+        # --- Local Minimum Escape Vars ---
+        MAX_RELAXED_ATTEMPTS = 2
+        relaxed_attempts_this_sequence = 0
+        stashed_vars_in_model = []
+        stashed_old_scores = np.array([])
+        stashed_best_mean_cv = np.nan
+        currently_in_relaxed_escape_sequence = False
+        # --- End Local Minimum Escape Vars ---
+
         all_candidate_features = list(rank_dict.keys())
-        max_feature_name_length = max(len(f) for f in all_candidate_features) if all_candidate_features else 20 # Запасной вариант, если список пуст
-        # --- КОНЕЦ ИЗМЕНЕНИЯ ---
+        max_feature_name_length = max(len(f) for f in all_candidate_features) if all_candidate_features else 20
 
         # Evaluate initial scores if not provided
         starting_from_scratch = ( len(vars_in_model) == 0 and old_scores is None and best_mean_cv is None )
@@ -687,32 +694,43 @@ class Kraken:
             print("[get_vars] Evaluating initial feature set (if any)...")
             inner_test_size = getattr(self, '_test_size_for_inner_split', 0.2)
             inner_random_state = getattr(self, '_random_state_for_inner_split', 42)
-            try:
-                old_scores, calc_mean_cv = self.evaluate_current_features(
-                    X, y, vars_in_model, group_dt, group_code,
-                    _test_size_for_inner_split=inner_test_size,
-                    _random_state_for_inner_split=inner_random_state
-                )
-            except TypeError as e:
-                 if '_test_size_for_inner_split' in str(e) or '_random_state_for_inner_split' in str(e):
-                     print("[get_vars] Warning: evaluate_current_features might need update for inner split params or group_code. Trying without them.")
-                     old_scores, calc_mean_cv = self.evaluate_current_features(X, y, vars_in_model, group_dt)
-                 else:
-                      print(f"[get_vars] Error during initial evaluation: {e}")
-                      raise e
+            
+            # Ensure n_splits is available for initialization if vars_in_model is empty
+            n_splits_for_init = self.cv.get_n_splits(X, y, group_dt) if hasattr(self.cv, 'get_n_splits') else self.cv.get_n_splits()
+
+            if len(vars_in_model) == 0: # Explicitly handle empty initial model
+                if self.greater_is_better:
+                    old_scores = np.full(n_splits_for_init, -np.inf)
+                    calc_mean_cv = -np.inf
+                else:
+                    old_scores = np.full(n_splits_for_init, np.inf)
+                    calc_mean_cv = np.inf
+                # Initial print for empty model will be handled by the generic print below
+            else:
+                try:
+                    old_scores, calc_mean_cv = self.evaluate_current_features(
+                        X, y, vars_in_model, group_dt, group_code,
+                        _test_size_for_inner_split=inner_test_size,
+                        _random_state_for_inner_split=inner_random_state
+                    )
+                except TypeError as e:
+                     if '_test_size_for_inner_split' in str(e) or '_random_state_for_inner_split' in str(e):
+                         print("[get_vars] Warning: evaluate_current_features might need update for inner split params or group_code. Trying without them.")
+                         old_scores, calc_mean_cv = self.evaluate_current_features(X, y, vars_in_model, group_dt)
+                     else:
+                          print(f"[get_vars] Error during initial evaluation: {e}")
+                          raise e
             if best_mean_cv is None: best_mean_cv = calc_mean_cv
 
-            if not starting_from_scratch:
-                 cv_init_display = "N/A"
-                 if pd.notna(best_mean_cv) and np.isfinite(best_mean_cv): cv_init_display = f"{best_mean_cv:{cv_format_str}}"
-                 elif pd.isna(best_mean_cv): cv_init_display = "NaN"
-                 else: cv_init_display = "Inf"
-                 print(f"[get_vars] Initial evaluation complete. Best CV: {cv_init_display}")
+            # Consolidated print for initial state
+            cv_init_display = "N/A"
+            if pd.notna(best_mean_cv) and np.isfinite(best_mean_cv): cv_init_display = f"{best_mean_cv:{cv_format_str}}"
+            elif pd.isna(best_mean_cv): cv_init_display = "NaN"
+            else: cv_init_display = "Inf" # Handles np.inf
+            print(f"[get_vars] Initial state: {len(vars_in_model)} features. Best CV: {cv_init_display}")
         
-        # --- ИЗМЕНЕНИЕ: Расчет ширины для отображения CV --- 
-        cv_display_width = 10 # Ширина по умолчанию
+        cv_display_width = 10
         ref_score_for_width = np.nan
-        # Используем baseline score если он валидный, иначе начальный best_mean_cv
         if hasattr(self, 'baseline_mean_cv_all_features') and pd.notna(self.baseline_mean_cv_all_features) and np.isfinite(self.baseline_mean_cv_all_features):
             ref_score_for_width = self.baseline_mean_cv_all_features
         elif best_mean_cv is not None and pd.notna(best_mean_cv) and np.isfinite(best_mean_cv):
@@ -720,12 +738,9 @@ class Kraken:
         
         if pd.notna(ref_score_for_width):
             formatted_ref_cv = f"{ref_score_for_width:.{self.comparison_precision}f}"
-            # Рассчитываем ширину на основе отформатированного референсного значения, но не менее ширины "-Inf"
             cv_display_width = max(len(formatted_ref_cv), len("-Inf"))
         else:
-            # Если референсного значения нет, используем ширину, достаточную для "-Inf" или "NaN" + запас
             cv_display_width = max(len("-Inf"), len("NaN"), 5 + self.comparison_precision if self.comparison_precision is not None else 10)
-        # --- КОНЕЦ ИЗМЕНЕНИЯ ---
 
         print("[get_vars] Starting feature selection procedure...")
         if starting_from_scratch: print(f"[get_vars] Starting from scratch (will check top {top_n_for_first_step} features first).")
@@ -739,25 +754,25 @@ class Kraken:
             print(f"  Initial best_mean_cv: {cv_log_display}")
 
         the_list_from_which_we_take_vars = [f for f in rank_dict.keys() if f not in vars_in_model]
-        feature_was_added = True
+        feature_was_added_outer_loop = True # Controls the main outer loop
         df_meta_info = pd.DataFrame()
 
-        while feature_was_added:
+        while feature_was_added_outer_loop:
+            feature_was_added_outer_loop = False # Assume no feature will be added in this iteration
             round_start = time.perf_counter()
-            var_for_add = ''
-            best_mean_cv_step = best_mean_cv
-            best_summa_step = -1
-            current_best_fold_scores_step = np.array([])
-            iteration_step = 0
+            
+            # --- Normal Selection Phase ---
+            var_for_add_normal = ''
+            best_mean_cv_normal_step = best_mean_cv # Start with current best
+            best_summa_normal_step = -1 
+            current_best_fold_scores_normal_step = np.array([])
+            iteration_step_normal = 0
             num_selected_before = len(vars_in_model)
 
-            if num_selected_before == 0 and top_n_for_first_step is not None and top_n_for_first_step > 0:
-                candidates_this_step = the_list_from_which_we_take_vars[:top_n_for_first_step]
-                print(f"\n--- Starting Step: Selecting feature #{num_selected_before + 1} (Checking top {len(candidates_this_step)}) ---")
-            else:
-                candidates_this_step = the_list_from_which_we_take_vars[:]
-                print(f"\n--- Starting Step: Selecting feature #{num_selected_before + 1} (Checking {len(candidates_this_step)}) ---")
-
+            use_top_n = (num_selected_before == 0 and top_n_for_first_step is not None and top_n_for_first_step > 0)
+            candidates_this_step = the_list_from_which_we_take_vars[:top_n_for_first_step] if use_top_n else the_list_from_which_we_take_vars[:]
+            
+            print(f"\n--- Starting Step (Normal Selection): Selecting feature #{num_selected_before + 1} (Checking {len(candidates_this_step)}{' top' if use_top_n else ''}) ---")
             cv_step_init_display = "N/A"
             if pd.notna(best_mean_cv) and np.isfinite(best_mean_cv): cv_step_init_display = f"{best_mean_cv:{cv_format_str}}"
             elif pd.isna(best_mean_cv): cv_step_init_display = "NaN"
@@ -765,181 +780,268 @@ class Kraken:
             print(f"    CV Before Step: {cv_step_init_display} | Target Summa Threshold to Add: {self.improvement_threshold}")
 
             total_candidates_in_step = len(candidates_this_step)
-            # --- ИЗМЕНЕНИЕ: Рассчитываем ширину для счетчиков --- 
             checks_width = len(str(max_feature_search_rounds))
             candidate_index_width = len(str(total_candidates_in_step))
-            # --- КОНЕЦ ИЗМЕНЕНИЯ ---
 
             for var_idx, var in enumerate(candidates_this_step):
-
-                if iteration_step >= max_feature_search_rounds:
-                    print(f"\n[get_vars] Reached step attempt limit ({max_feature_search_rounds} checks without improvement). Stopping search for this step.", flush=True)
+                if iteration_step_normal >= max_feature_search_rounds:
+                    print(f"\n[get_vars] Normal Selection: Reached step attempt limit ({max_feature_search_rounds} checks without improvement).", flush=True)
                     break
-
-                iteration_step += 1
-
-                display_var = 'None'
-                display_summa = 'N/A'
-                display_cv = 'N/A'
-
-                if var_for_add != '':
-                    # --- ИЗМЕНЕНИЕ: Отображаем лучшего кандидата, только если его summa >= 0 --- 
-                    if best_summa_step >= 0: 
-                        display_var = var_for_add
-                        display_summa = str(best_summa_step)
-                        if pd.notna(best_mean_cv_step) and np.isfinite(best_mean_cv_step):
-                            formatted_cv = f"{best_mean_cv_step:{cv_format_str}}"
-                            display_cv = formatted_cv.ljust(cv_display_width)
-                        elif pd.isna(best_mean_cv_step):
-                            display_cv = 'NaN'.ljust(cv_display_width)
-                        else:
-                            display_cv = 'Inf'.ljust(cv_display_width)
-                    # Если лучший кандидат имеет summa < 0, то поля display_* остаются 'None'/'N/A'
-                    # --- КОНЕЦ ИЗМЕНЕНИЯ --- 
-
-                # --- ИЗМЕНЕНИЕ: Используем max_feature_name_length и ширину счетчиков для выравнивания --- 
-                status_line = ( f"\rStep {num_selected_before + 1} | Checks since last best: {iteration_step:0{checks_width}d}/{max_feature_search_rounds:0{checks_width}d} | "
-                    f"Checking cand. [{var_idx+1:0{candidate_index_width}d}/{total_candidates_in_step:0{candidate_index_width}d}]: {var:<{max_feature_name_length}} | "
-                    f"Best valid cand. (step): {display_var:<{max_feature_name_length}} (Summa: {display_summa}, CV: {display_cv})" )
-                # --- КОНЕЦ ИЗМЕНЕНИЯ --- 
-                try: term_width = os.get_terminal_size().columns
-                except OSError: term_width = 120
-                print(status_line.ljust(term_width), end='', flush=True)
+                iteration_step_normal += 1
+                display_var = 'None'; display_summa = 'N/A'; display_cv = 'N/A'
+                if var_for_add_normal != '':
+                    if best_summa_normal_step >= 0: 
+                        display_var = var_for_add_normal
+                        display_summa = str(best_summa_normal_step)
+                        if pd.notna(best_mean_cv_normal_step) and np.isfinite(best_mean_cv_normal_step):
+                            display_cv = f"{best_mean_cv_normal_step:{cv_format_str}}".ljust(cv_display_width)
+                        elif pd.isna(best_mean_cv_normal_step): display_cv = 'NaN'.ljust(cv_display_width)
+                        else: display_cv = 'Inf'.ljust(cv_display_width)
+                
+                status_line = ( f"\rNormal Sel. Checks: {iteration_step_normal:0{checks_width}d}/{max_feature_search_rounds:0{checks_width}d} | "
+                    f"Cand. [{var_idx+1:0{candidate_index_width}d}/{total_candidates_in_step:0{candidate_index_width}d}]: {var:<{max_feature_name_length}} | "
+                    f"Best (normal): {display_var:<{max_feature_name_length}} (Summa: {display_summa}, CV: {display_cv})" )
+                try: term_width = os.get_terminal_size().columns; print(status_line.ljust(term_width), end='', flush=True)
+                except OSError: print(status_line, end='', flush=True) # Fallback for non-terminal
 
                 selected_vars_copy = vars_in_model.copy()
                 inner_test_size_cv = getattr(self, '_test_size_for_inner_split', 0.2)
                 inner_random_state_cv = getattr(self, '_random_state_for_inner_split', 42)
                 try:
                      fold_scores, summa, mean_cv_score = self.get_cross_val_score(
-                         X=X, y=y, var=var, old_scores=old_scores,
-                         selected_vars=selected_vars_copy, group_dt=group_dt,
-                         group_code=group_code,
-                         _test_size_for_inner_split=inner_test_size_cv,
-                         _random_state_for_inner_split=inner_random_state_cv,
-                         verbose=False
-                     )
+                         X=X, y=y, var=var, old_scores=old_scores.copy(), # Pass copy of old_scores
+                         selected_vars=selected_vars_copy, group_dt=group_dt, group_code=group_code,
+                         _test_size_for_inner_split=inner_test_size_cv, _random_state_for_inner_split=inner_random_state_cv, verbose=False)
                 except TypeError as e_cv:
                      if '_test_size_for_inner_split' in str(e_cv) or '_random_state_for_inner_split' in str(e_cv):
-                         print(f"\n[!] Warning: get_cross_val_score needs update for inner split params or group_code? Trying without them for '{var}'.", flush=True)
+                         print(f"\n[!] Warning: get_cross_val_score needs update. Trying without inner split params for '{var}'.", flush=True)
                          fold_scores, summa, mean_cv_score = self.get_cross_val_score(
-                             X=X, y=y, var=var, old_scores=old_scores,
-                             selected_vars=selected_vars_copy, group_dt=group_dt, verbose=False
-                         )
-                     else:
-                          print(f"\n[!] ERROR calling get_cross_val_score for '{var}': {e_cv}", flush=True)
-                          del selected_vars_copy; gc.collect(); continue
+                             X=X, y=y, var=var, old_scores=old_scores.copy(), selected_vars=selected_vars_copy, group_dt=group_dt, verbose=False)
+                     else: print(f"\n[!] ERROR calling get_cross_val_score for '{var}': {e_cv}", flush=True); del selected_vars_copy; gc.collect(); continue
 
-                if pd.isna(mean_cv_score):
-                    print(f"\n[!] Warning: CV score calculation returned NaN for '{var}'. Skipping.", flush=True)
-                    del fold_scores, summa, mean_cv_score, selected_vars_copy; gc.collect(); continue
+                if pd.isna(mean_cv_score): print(f"\n[!] Warning: CV score NaN for '{var}'. Skipping.", flush=True); del fold_scores, summa, mean_cv_score, selected_vars_copy; gc.collect(); continue
 
-                compare_cv_step = np.nan
-                if var_for_add:
-                     compare_cv_step = best_mean_cv_step
-
-                current_mean_cv_finite = mean_cv_score
-                if pd.isna(current_mean_cv_finite) or not np.isfinite(current_mean_cv_finite):
-                     current_mean_cv_finite = -np.inf if self.greater_is_better else np.inf
-
-                compare_cv_step_finite = compare_cv_step
-                if pd.isna(compare_cv_step_finite) or not np.isfinite(compare_cv_step_finite):
-                    compare_cv_step_finite = -np.inf if self.greater_is_better else np.inf
-
-                is_equal_cv_step = np.isclose(current_mean_cv_finite, compare_cv_step_finite, atol=tolerance)
+                compare_cv_normal_step = np.nan
+                if var_for_add_normal: compare_cv_normal_step = best_mean_cv_normal_step
+                current_mean_cv_finite = mean_cv_score if np.isfinite(mean_cv_score) else (-np.inf if self.greater_is_better else np.inf)
+                compare_cv_normal_step_finite = compare_cv_normal_step if np.isfinite(compare_cv_normal_step) else (-np.inf if self.greater_is_better else np.inf)
+                is_equal_cv_normal_step = np.isclose(current_mean_cv_finite, compare_cv_normal_step_finite, atol=tolerance)
                 
-                # --- ИЗМЕНЕНИЕ: Уточненный приоритет summa и CV --- 
-                condition_met_step = False
-                is_better_summa = summa > best_summa_step
-                is_equal_summa = summa == best_summa_step
-                
+                condition_met_normal_step = False
+                is_better_summa = summa > best_summa_normal_step
+                is_equal_summa = summa == best_summa_normal_step
                 if self.greater_is_better:
-                    is_strictly_better_cv = current_mean_cv_finite > compare_cv_step_finite and not is_equal_cv_step
-                    # CV не хуже (лучше или равен)
-                    is_not_worse_cv = current_mean_cv_finite >= compare_cv_step_finite 
-                    # Условие: (summa лучше И CV не хуже) ИЛИ (summa равна И CV строго лучше)
-                    condition_met_step = (is_better_summa and is_not_worse_cv) or \
-                                         (is_equal_summa and is_strictly_better_cv)
-                else: # lower is better
-                    is_strictly_better_cv = current_mean_cv_finite < compare_cv_step_finite and not is_equal_cv_step
-                    # CV не хуже (лучше или равен)
-                    is_not_worse_cv = current_mean_cv_finite <= compare_cv_step_finite
-                    # Условие: (summa лучше И CV не хуже) ИЛИ (summa равна И CV строго лучше)
-                    condition_met_step = (is_better_summa and is_not_worse_cv) or \
-                                         (is_equal_summa and is_strictly_better_cv)
-                # --- КОНЕЦ ИЗМЕНЕНИЯ --- 
-
-                if condition_met_step:
-                    best_summa_step = summa
-                    best_mean_cv_step = mean_cv_score
-                    current_best_fold_scores_step = fold_scores
-                    var_for_add = var
-                    iteration_step = 0
-                del fold_scores, summa, mean_cv_score, selected_vars_copy; gc.collect()
-            print()
-
-            round_end = time.perf_counter()
-            print(f"--- Step finished in {round_end - round_start:.2f} seconds ---")
-
-            improvement_confirmed = False
-            if var_for_add != '':
-                initial_cv_for_step = best_mean_cv
-                best_cv_step_finite = best_mean_cv_step
-                if pd.isna(best_cv_step_finite) or not np.isfinite(best_cv_step_finite):
-                     best_cv_step_finite = -np.inf if self.greater_is_better else np.inf
-
-                initial_cv_finite = initial_cv_for_step
-                if pd.isna(initial_cv_finite) or not np.isfinite(initial_cv_finite):
-                     initial_cv_finite = -np.inf if self.greater_is_better else np.inf
-
-                is_equal_to_start_cv = np.isclose(best_cv_step_finite, initial_cv_finite, atol=tolerance)
-                
-                # --- ИСПРАВЛЕНИЕ: всегда требуем summa >= improvement_threshold ---
-                if self.greater_is_better:
-                    improvement_confirmed = best_summa_step >= self.improvement_threshold and (
-                        (best_cv_step_finite > initial_cv_finite and not is_equal_to_start_cv) or is_equal_to_start_cv
-                    )
+                    is_strictly_better_cv = current_mean_cv_finite > compare_cv_normal_step_finite and not is_equal_cv_normal_step
+                    is_not_worse_cv = current_mean_cv_finite >= compare_cv_normal_step_finite - tolerance # Allow for slight tolerance
+                    condition_met_normal_step = (is_better_summa and is_not_worse_cv) or (is_equal_summa and is_strictly_better_cv)
                 else:
-                    improvement_confirmed = best_summa_step >= self.improvement_threshold and (
-                        (best_cv_step_finite < initial_cv_finite and not is_equal_to_start_cv) or is_equal_to_start_cv
-                    )
-                # --- КОНЕЦ ИСПРАВЛЕНИЯ ---
+                    is_strictly_better_cv = current_mean_cv_finite < compare_cv_normal_step_finite and not is_equal_cv_normal_step
+                    is_not_worse_cv = current_mean_cv_finite <= compare_cv_normal_step_finite + tolerance # Allow for slight tolerance
+                    condition_met_normal_step = (is_better_summa and is_not_worse_cv) or (is_equal_summa and is_strictly_better_cv)
 
-            if var_for_add != '' and improvement_confirmed:
-                vars_in_model.append(var_for_add)
-                the_list_from_which_we_take_vars.remove(var_for_add)
-                old_scores = current_best_fold_scores_step
-                best_mean_cv = best_mean_cv_step
-                print(f"[+] Feature Added: '{var_for_add}'")
-                cv_added_display = "N/A"
-                if pd.notna(best_mean_cv) and np.isfinite(best_mean_cv): cv_added_display = f"{best_mean_cv:{cv_format_str}}"
-                elif pd.isna(best_mean_cv): cv_added_display = "NaN"
-                else: cv_added_display = "Inf"
-                print(f"    New Best Mean CV: {cv_added_display} (Achieved Summa: {best_summa_step})")
+                if condition_met_normal_step:
+                    best_summa_normal_step = summa; best_mean_cv_normal_step = mean_cv_score
+                    current_best_fold_scores_normal_step = fold_scores; var_for_add_normal = var
+                    iteration_step_normal = 0 
+                del fold_scores, summa, mean_cv_score, selected_vars_copy; gc.collect()
+            print() # Newline after status updates
+
+            improvement_confirmed_normal = False
+            if var_for_add_normal != '':
+                initial_cv_for_normal_step = best_mean_cv
+                best_cv_normal_step_finite = best_mean_cv_normal_step if np.isfinite(best_mean_cv_normal_step) else (-np.inf if self.greater_is_better else np.inf)
+                initial_cv_finite = initial_cv_for_normal_step if np.isfinite(initial_cv_for_normal_step) else (-np.inf if self.greater_is_better else np.inf)
+                is_equal_to_start_cv_normal = np.isclose(best_cv_normal_step_finite, initial_cv_finite, atol=tolerance)
+                
+                if self.greater_is_better:
+                    improvement_confirmed_normal = best_summa_normal_step >= self.improvement_threshold and \
+                                                   ( (best_cv_normal_step_finite > initial_cv_finite and not is_equal_to_start_cv_normal) or is_equal_to_start_cv_normal )
+                else:
+                    improvement_confirmed_normal = best_summa_normal_step >= self.improvement_threshold and \
+                                                   ( (best_cv_normal_step_finite < initial_cv_finite and not is_equal_to_start_cv_normal) or is_equal_to_start_cv_normal )
+
+            if improvement_confirmed_normal:
+                vars_in_model.append(var_for_add_normal)
+                the_list_from_which_we_take_vars.remove(var_for_add_normal)
+                old_scores = current_best_fold_scores_normal_step.copy() # Ensure copy
+                best_mean_cv = best_mean_cv_normal_step
+                print(f"[+] Feature Added (Normal): '{var_for_add_normal}'")
+                cv_added_display = f"{best_mean_cv:{cv_format_str}}" if pd.notna(best_mean_cv) and np.isfinite(best_mean_cv) else ('NaN' if pd.isna(best_mean_cv) else 'Inf')
+                print(f"    New Best Mean CV: {cv_added_display} (Achieved Summa: {best_summa_normal_step})")
                 print(f"    Selected Features ({len(vars_in_model)}): {vars_in_model}")
-                def r(x):
-                    if self.comparison_precision is not None and pd.notna(x) and np.isfinite(x):
-                        return round(x, self.comparison_precision)
-                    return x
-                best_mean_cv_for_csv = r(best_mean_cv)
-                fold_scores_for_csv = [r(s) for s in old_scores] if old_scores is not None else []
-                list_meta = ( [vars_in_model.copy()] + [best_summa_step] + [best_mean_cv_for_csv] + fold_scores_for_csv )
-                df_meta = pd.DataFrame([list_meta])
-                n_splits_meta = len(old_scores) if old_scores is not None and len(old_scores) > 0 else 0
-                if n_splits_meta == 0:
-                     try: n_splits_meta = self.cv.get_n_splits(X, y, group_dt) if hasattr(self.cv, 'get_n_splits') else self.cv.get_n_splits()
-                     except: n_splits_meta = 0
-                df_meta.columns = ( ['vars', 'summa', 'mean_cv_scores'] + [f'cv{i}' for i in range(1, n_splits_meta + 1)] )
+                
+                # Update meta info
+                def r(x): return round(x, self.comparison_precision) if self.comparison_precision is not None and pd.notna(x) and np.isfinite(x) else x
+                list_meta = [vars_in_model.copy(), best_summa_normal_step, r(best_mean_cv)] + [r(s) for s in old_scores]
+                n_splits_meta = len(old_scores)
+                df_meta = pd.DataFrame([list_meta], columns=['vars', 'summa', 'mean_cv_scores'] + [f'cv{i}' for i in range(1, n_splits_meta + 1)])
                 df_meta_info = pd.concat([df_meta_info, df_meta], ignore_index=True)
-                try:
-                    df_meta_info.to_csv(f'df_meta_info_{self.meta_info_name}.csv', index=False)
-                    print(f"    Meta info saved to df_meta_info_{self.meta_info_name}.csv")
+                try: df_meta_info.to_csv(f'df_meta_info_{self.meta_info_name}.csv', index=False); print(f"    Meta info saved.")
                 except Exception as e: print(f"[!] Error saving meta info: {e}")
-                del df_meta;
-                if 'current_best_fold_scores_step' in locals(): del current_best_fold_scores_step
-                gc.collect(); feature_was_added = True
-            else:
-                print("[-] No feature found that improves the score in this step. Stopping.")
-                feature_was_added = False
+
+                feature_was_added_outer_loop = True # Signal that a feature was added
+                if currently_in_relaxed_escape_sequence:
+                    print(f"[*] Normal feature addition successful during relaxed escape sequence. Resetting sequence.")
+                    currently_in_relaxed_escape_sequence = False
+                    relaxed_attempts_this_sequence = 0
+                    stashed_vars_in_model.clear()
+                    stashed_old_scores = np.array([])
+                    stashed_best_mean_cv = np.nan
+                
+                del current_best_fold_scores_normal_step; gc.collect()
+                print(f"--- Normal Selection Step finished in {time.perf_counter() - round_start:.2f} seconds ---")
+                continue # Restart main loop
+
+            # --- Relaxed Selection Phase (if normal selection failed) ---
+            print(f"[-] Normal selection did not find an improving feature.")
+            if not currently_in_relaxed_escape_sequence:
+                print("[*] Starting new relaxed escape sequence.")
+                currently_in_relaxed_escape_sequence = True
+                relaxed_attempts_this_sequence = 0
+                stashed_vars_in_model = vars_in_model.copy()
+                stashed_old_scores = old_scores.copy() # Ensure copy
+                stashed_best_mean_cv = best_mean_cv
+            
+            if relaxed_attempts_this_sequence < MAX_RELAXED_ATTEMPTS:
+                relaxed_attempts_this_sequence += 1
+                print(f"\n--- Starting Relaxed Selection Attempt #{relaxed_attempts_this_sequence}/{MAX_RELAXED_ATTEMPTS} ---")
+                print(f"    Stashed CV: {stashed_best_mean_cv:{cv_format_str} if pd.notna(stashed_best_mean_cv) and np.isfinite(stashed_best_mean_cv) else ('NaN' if pd.isna(stashed_best_mean_cv) else 'Inf')}")
+                print(f"    Current CV to beat (relaxed): {best_mean_cv:{cv_format_str} if pd.notna(best_mean_cv) and np.isfinite(best_mean_cv) else ('NaN' if pd.isna(best_mean_cv) else 'Inf')}")
+
+                var_for_add_relaxed = ''
+                best_mean_cv_relaxed_step = best_mean_cv # Must improve current best_mean_cv
+                current_best_fold_scores_relaxed_step = np.array([])
+                
+                # In relaxed, we check all available features not in model
+                candidates_relaxed_step = [f for f in rank_dict.keys() if f not in vars_in_model] # Re-evaluate candidates
+                total_candidates_relaxed = len(candidates_relaxed_step)
+                candidate_index_width_relaxed = len(str(total_candidates_relaxed))
+
+                for var_idx_rel, var_rel in enumerate(candidates_relaxed_step):
+                    display_var_rel = 'None'; display_cv_rel = 'N/A'
+                    if var_for_add_relaxed != '':
+                        if pd.notna(best_mean_cv_relaxed_step) and np.isfinite(best_mean_cv_relaxed_step):
+                             display_var_rel = var_for_add_relaxed
+                             display_cv_rel = f"{best_mean_cv_relaxed_step:{cv_format_str}}".ljust(cv_display_width)
+                        elif pd.isna(best_mean_cv_relaxed_step): display_cv_rel = 'NaN'.ljust(cv_display_width)
+                        else: display_cv_rel = 'Inf'.ljust(cv_display_width)
+
+                    status_line_rel = ( f"\rRelaxed Attempt {relaxed_attempts_this_sequence} | Cand. [{var_idx_rel+1:0{candidate_index_width_relaxed}d}/{total_candidates_relaxed:0{candidate_index_width_relaxed}d}]: {var_rel:<{max_feature_name_length}} | "
+                        f"Best (relaxed): {display_var_rel:<{max_feature_name_length}} (CV: {display_cv_rel})" )
+                    try: term_width = os.get_terminal_size().columns; print(status_line_rel.ljust(term_width), end='', flush=True)
+                    except OSError: print(status_line_rel, end='', flush=True)
+
+                    selected_vars_copy_rel = vars_in_model.copy()
+                    # In relaxed, old_scores for get_cross_val_score should be the current model's scores
+                    fold_scores_rel, _, mean_cv_score_rel = self.get_cross_val_score(
+                        X=X, y=y, var=var_rel, old_scores=old_scores.copy(), # Pass copy of current old_scores
+                        selected_vars=selected_vars_copy_rel, group_dt=group_dt, group_code=group_code,
+                        _test_size_for_inner_split=inner_test_size_cv, _random_state_for_inner_split=inner_random_state_cv, verbose=False
+                    )
+                    if pd.isna(mean_cv_score_rel): print(f"\n[!] Warning (Relaxed): CV score NaN for '{var_rel}'. Skipping.", flush=True); del fold_scores_rel, mean_cv_score_rel, selected_vars_copy_rel; gc.collect(); continue
+
+                    current_mean_cv_rel_finite = mean_cv_score_rel if np.isfinite(mean_cv_score_rel) else (-np.inf if self.greater_is_better else np.inf)
+                    # Compare against the best CV found *in this relaxed step* OR the current overall best_mean_cv if no relaxed var picked yet
+                    compare_cv_relaxed_finite = best_mean_cv_relaxed_step if np.isfinite(best_mean_cv_relaxed_step) else (-np.inf if self.greater_is_better else np.inf)
+                    
+                    is_equal_cv_relaxed = np.isclose(current_mean_cv_rel_finite, compare_cv_relaxed_finite, atol=tolerance)
+                    improvement_in_relaxed_step = False
+                    if self.greater_is_better:
+                        improvement_in_relaxed_step = current_mean_cv_rel_finite > compare_cv_relaxed_finite and not is_equal_cv_relaxed
+                    else: # lower is better
+                        improvement_in_relaxed_step = current_mean_cv_rel_finite < compare_cv_relaxed_finite and not is_equal_cv_relaxed
+                    
+                    if improvement_in_relaxed_step:
+                        best_mean_cv_relaxed_step = mean_cv_score_rel
+                        current_best_fold_scores_relaxed_step = fold_scores_rel
+                        var_for_add_relaxed = var_rel
+                    del fold_scores_rel, mean_cv_score_rel, selected_vars_copy_rel; gc.collect()
+                print() # Newline after status updates
+                
+                # Check if the best relaxed feature found is an improvement over current best_mean_cv
+                best_relaxed_cv_finite = best_mean_cv_relaxed_step if np.isfinite(best_mean_cv_relaxed_step) else (-np.inf if self.greater_is_better else np.inf)
+                current_overall_best_cv_finite = best_mean_cv if np.isfinite(best_mean_cv) else (-np.inf if self.greater_is_better else np.inf)
+                is_equal_to_overall_best = np.isclose(best_relaxed_cv_finite, current_overall_best_cv_finite, atol=tolerance)
+
+                relaxed_improvement_over_overall_best = False
+                if self.greater_is_better:
+                    relaxed_improvement_over_overall_best = best_relaxed_cv_finite > current_overall_best_cv_finite and not is_equal_to_overall_best
+                else:
+                    relaxed_improvement_over_overall_best = best_relaxed_cv_finite < current_overall_best_cv_finite and not is_equal_to_overall_best
+
+                if var_for_add_relaxed != '' and relaxed_improvement_over_overall_best:
+                    vars_in_model.append(var_for_add_relaxed)
+                    the_list_from_which_we_take_vars.remove(var_for_add_relaxed)
+                    old_scores = current_best_fold_scores_relaxed_step.copy() # Ensure copy
+                    best_mean_cv = best_mean_cv_relaxed_step
+                    print(f"[+] Feature Added (Relaxed Attempt #{relaxed_attempts_this_sequence}): '{var_for_add_relaxed}'")
+                    cv_added_display_rel = f"{best_mean_cv:{cv_format_str}}" if pd.notna(best_mean_cv) and np.isfinite(best_mean_cv) else ('NaN' if pd.isna(best_mean_cv) else 'Inf')
+                    print(f"    New Best Mean CV: {cv_added_display_rel}")
+                    print(f"    Selected Features ({len(vars_in_model)}): {vars_in_model}")
+
+                    # Update meta info for relaxed add (summa = -999)
+                    def r(x): return round(x, self.comparison_precision) if self.comparison_precision is not None and pd.notna(x) and np.isfinite(x) else x
+                    list_meta_rel = [vars_in_model.copy(), -999, r(best_mean_cv)] + [r(s) for s in old_scores]
+                    n_splits_meta_rel = len(old_scores)
+                    df_meta_rel = pd.DataFrame([list_meta_rel], columns=['vars', 'summa', 'mean_cv_scores'] + [f'cv{i}' for i in range(1, n_splits_meta_rel + 1)])
+                    df_meta_info = pd.concat([df_meta_info, df_meta_rel], ignore_index=True)
+                    try: df_meta_info.to_csv(f'df_meta_info_{self.meta_info_name}.csv', index=False); print(f"    Meta info saved.")
+                    except Exception e: print(f"[!] Error saving meta info (relaxed): {e}")
+                    
+                    feature_was_added_outer_loop = True # Signal that a feature was added
+                    # No reset of currently_in_relaxed_escape_sequence here, it continues
+                    del current_best_fold_scores_relaxed_step; gc.collect()
+                    print(f"--- Relaxed Selection Attempt #{relaxed_attempts_this_sequence} finished in {time.perf_counter() - round_start:.2f} seconds ---")
+                    continue # Restart main loop
+                else:
+                    print(f"[-] Relaxed Attempt #{relaxed_attempts_this_sequence} did not find an improving feature over current best CV ({best_mean_cv:{cv_format_str}}).")
+                    # feature_was_added_outer_loop remains False for this iteration if this relaxed attempt also failed.
+            
+            # --- Rollback Condition Check ---
+            # This check happens if:
+            # 1. Normal selection failed (feature_was_added_outer_loop is False from start of iteration)
+            # 2. We are in a relaxed sequence.
+            # 3. All relaxed attempts for this sequence are exhausted.
+            if not feature_was_added_outer_loop and currently_in_relaxed_escape_sequence and relaxed_attempts_this_sequence >= MAX_RELAXED_ATTEMPTS:
+                print(f"\n[!] All relaxed attempts ({relaxed_attempts_this_sequence}/{MAX_RELAXED_ATTEMPTS}) failed to improve beyond stashed CV or current CV.")
+                print(f"    Current CV: {best_mean_cv:{cv_format_str}}, Stashed CV: {stashed_best_mean_cv:{cv_format_str}}")
+                
+                # Check if current state is worse than stashed state (or not better)
+                current_cv_finite_for_rollback = best_mean_cv if np.isfinite(best_mean_cv) else (-np.inf if self.greater_is_better else np.inf)
+                stashed_cv_finite_for_rollback = stashed_best_mean_cv if np.isfinite(stashed_best_mean_cv) else (-np.inf if self.greater_is_better else np.inf)
+                
+                needs_rollback = False
+                if self.greater_is_better:
+                    needs_rollback = current_cv_finite_for_rollback < stashed_cv_finite_for_rollback # Strict less than
+                else: # lower is better
+                    needs_rollback = current_cv_finite_for_rollback > stashed_cv_finite_for_rollback # Strict greater than
+                
+                # Also rollback if equal, as no improvement means escape failed
+                if np.isclose(current_cv_finite_for_rollback, stashed_cv_finite_for_rollback, atol=tolerance):
+                    needs_rollback = True
+
+                if needs_rollback:
+                    print("[!] Rolling back to stashed state before relaxed sequence began.")
+                    vars_in_model = stashed_vars_in_model.copy()
+                    old_scores = stashed_old_scores.copy() # Ensure copy
+                    best_mean_cv = stashed_best_mean_cv
+                    the_list_from_which_we_take_vars = [f for f in rank_dict.keys() if f not in vars_in_model] # Crucial update
+                    print(f"    Rolled back to {len(vars_in_model)} features. CV restored to: {best_mean_cv:{cv_format_str}}")
+                else:
+                    print("[*] Current state is not worse than stashed state. No rollback, but escape sequence ends.")
+
+                # Reset relaxed sequence state in either case (rollback or not, sequence ends here if max attempts reached and no add)
+                currently_in_relaxed_escape_sequence = False
+                relaxed_attempts_this_sequence = 0
+                stashed_vars_in_model.clear()
+                stashed_old_scores = np.array([])
+                stashed_best_mean_cv = np.nan
+                feature_was_added_outer_loop = False # Ensure main loop terminates
+            
+            # If no feature added (normal or relaxed), and not rolled back, loop terminates as feature_was_added_outer_loop is False.
+            if not feature_was_added_outer_loop:
+                 print(f"--- Step finished in {time.perf_counter() - round_start:.2f} seconds. No feature added. ---")
+
 
         print("-" * 30)
         print('[get_vars] Final feature set:')
