@@ -1,11 +1,17 @@
 # tools.py
 import numpy as np
 import pandas as pd
-import shap
 import gc
 import time
 import os
 import pickle
+
+try:
+    import shap  # type: ignore
+    _shap_available = True
+except ImportError:
+    shap = None  # type: ignore
+    _shap_available = False
 
 from typing import Any, Callable, Optional, List, Tuple, Iterator, Union
 
@@ -107,7 +113,7 @@ class Kraken:
     """
     Class for greedy feature selection using a given metric.
     Works for both classification (predict_proba) and regression (predict) tasks.
-    Also calculates SHAP-values (via TreeExplainer).
+    Supports SHAP-based (TreeExplainer) or permutation-based feature importances.
     """
 
     def __init__(
@@ -128,15 +134,25 @@ class Kraken:
         importances_cache_path: str = 'fe_dict_cache.pkl',
         sample_frac_for_shap: float = 1.0,
         # Parameter can be either int or string 'average'
-        which_class_for_shap: Union[int, str] = 1
+        which_class_for_shap: Union[int, str] = 1,
+        importance_method: str = 'shap',
+        permutation_n_repeats: int = 5,
+        permutation_random_state: Optional[int] = None
     ):
         """
         Args:
             ...
-            which_class_for_shap (int or str): 
+            which_class_for_shap (int or str):
                 - If int, use shap_values[which_class_for_shap]
                 - If 'average', average across all classes
                 - Default 1 (i.e., shap_values[1] for binary classification)
+            importance_method (str): Which importance strategy to use. Supports
+                'shap' (default) or 'permutation'. If 'shap' is selected but
+                the shap package is unavailable, an ImportError is raised.
+            permutation_n_repeats (int): Number of shuffles per feature when
+                using permutation importance.
+            permutation_random_state (Optional[int]): Seed for permutation
+                importance shuffling.
         """
         self.estimator = estimator
         self.cv = cv
@@ -172,6 +188,16 @@ class Kraken:
         # Can be integer or 'average'
         self.which_class_for_shap = which_class_for_shap
 
+        self.importance_method = importance_method.lower() if importance_method is not None else 'shap'
+        if self.importance_method not in {'shap', 'permutation'}:
+            raise ValueError("importance_method must be either 'shap' or 'permutation'")
+        if self.importance_method == 'shap' and not _shap_available:
+            raise ImportError("The 'shap' package is required for importance_method='shap'. "
+                              "Install shap or set importance_method='permutation'.")
+
+        self.permutation_n_repeats = permutation_n_repeats
+        self.permutation_random_state = permutation_random_state
+
     def get_rank_dict(
         self,
         X: pd.DataFrame,
@@ -184,21 +210,24 @@ class Kraken:
         random_state_for_inner_split: int = 42
     ):
         """
-        Calculate SHAP importances and baseline metric on all features across all folds
-        using a dynamic status update line. Accepts optional group_code for metrics.
+        Calculate feature importances (SHAP or permutation) and baseline metric on all
+        features across all folds using a dynamic status update line. Accepts optional
+        group_code for metrics.
         """
-        # 1. Check SHAP cache
+        # 1. Check importance cache
         if self.cache_importances and os.path.exists(self.importances_cache_path):
             print("[get_rank_dict] Found importance cache. Loading...")
             try:
                 with open(self.importances_cache_path, 'rb') as f:
                     cached_data = pickle.load(f)
-                if 'fe_dict' in cached_data and 'rank_dict' in cached_data:
+                cached_method = cached_data.get('importance_method', 'shap')
+                if cached_method != self.importance_method:
+                    print("[get_rank_dict] Cache importance method mismatch. Recalculating importance and baseline.")
+                elif 'fe_dict' in cached_data and 'rank_dict' in cached_data:
                     self.fe_dict = cached_data['fe_dict']
                     self.rank_dict = cached_data['rank_dict']
                     print("[get_rank_dict] Importances loaded from cache.")
-                    # --- Calculate baseline separately if SHAP is cached ---
-                    print("[get_rank_dict] Calculating baseline score separately as SHAP is cached...")
+                    print("[get_rank_dict] Calculating baseline score separately as importances are cached...")
                     try:
                         bl_scores, bl_mean = self.evaluate_current_features(
                             X, y, list_of_vars, group_dt, group_code,
@@ -226,13 +255,13 @@ class Kraken:
                         self.baseline_mean_cv_all_features = None; self.baseline_fold_scores_all_features = None
                     return
                 else:
-                    print("[get_rank_dict] Cache file incomplete. Recalculating SHAP and baseline.")
+                    print("[get_rank_dict] Cache file incomplete. Recalculating importance and baseline.")
             except Exception as e:
-                print(f"[get_rank_dict] Error loading cache: {e}. Recalculating SHAP and baseline.")
+                print(f"[get_rank_dict] Error loading cache: {e}. Recalculating importance and baseline.")
 
-        print("[get_rank_dict] Starting combined baseline evaluation and SHAP calculation...")
+        print("[get_rank_dict] Starting combined baseline evaluation and importance calculation...")
         global_start_time = time.perf_counter()
-        local_dict_fold_importances = {'Feature': list_of_vars, 'abs_shap': np.zeros(len(list_of_vars))}
+        local_dict_fold_importances = {'Feature': list_of_vars, 'importance': np.zeros(len(list_of_vars))}
         estimator_for_shap = shap_estimator if shap_estimator is not None else self.estimator
         baseline_fold_scores = []
         self.fe_dict = None; self.rank_dict = None; self.baseline_mean_cv_all_features = np.nan; self.baseline_fold_scores_all_features = None
@@ -289,55 +318,128 @@ class Kraken:
 
                 _update_status(fold, n_splits, "Calculating baseline...", fold_start_time, global_start_time)
                 score_baseline = np.nan
+                y_pred_baseline_original_scale = None
                 try:
                     if self.task_type == 'classification':
                         if hasattr(model, 'predict_proba'):
                             proba = model.predict_proba(X_test[list_of_vars])
-                            if proba.ndim == 2 and proba.shape[1] > 1: y_pred_baseline = proba[:, 1]
-                            elif proba.ndim == 1: y_pred_baseline = proba
-                            else: print(f"\n[!] Warning: Fold {fold} - Unexpected predict_proba shape: {proba.shape}", flush=True)
-                        else: y_pred_baseline = model.predict(X_test[list_of_vars])
-                    else: y_pred_baseline = model.predict(X_test[list_of_vars])
+                            if proba.ndim == 2 and proba.shape[1] > 1:
+                                y_pred_baseline = proba[:, 1]
+                            elif proba.ndim == 1:
+                                y_pred_baseline = proba
+                            else:
+                                print(f"\n[!] Warning: Fold {fold} - Unexpected predict_proba shape: {proba.shape}", flush=True)
+                        else:
+                            y_pred_baseline = model.predict(X_test[list_of_vars])
+                    else:
+                        y_pred_baseline = model.predict(X_test[list_of_vars])
                     if y_pred_baseline is not None:
                         try:
-                            # --- ИЗМЕНЕНИЕ: Применяем inverse_transform ---
                             y_pred_baseline_original_scale = self.inverse_transform(y_pred_baseline)
-                            # --- КОНЕЦ ИЗМЕНЕНИЯ ---
                             score_baseline = self.metric(y_test, y_pred_baseline_original_scale, group_code=group_code_test)
                         except TypeError:
-                            # --- ИЗМЕНЕНИЕ: Используем трансформированные обратно предсказания ---
                             score_baseline = self.metric(y_test, y_pred_baseline_original_scale)
-                            # --- КОНЕЦ ИЗМЕНЕНИЯ ---
-                except Exception as e_bl_fold: print(f"\n[!] ERROR: Fold {fold} - Baseline calculation failed: {e_bl_fold}", flush=True)
+                except Exception as e_bl_fold:
+                    print(f"\n[!] ERROR: Fold {fold} - Baseline calculation failed: {e_bl_fold}", flush=True)
                 baseline_fold_scores.append(score_baseline)
                 _update_status(fold, n_splits, "Baseline calculated.", fold_start_time, global_start_time)
 
-                _update_status(fold, n_splits, "Calculating SHAP...", fold_start_time, global_start_time)
-                try:
-                    explainer = shap.TreeExplainer(model)
-                    if self.sample_frac_for_shap < 1.0: X_test_sampled = X_test[list_of_vars].sample(frac=self.sample_frac_for_shap, random_state=random_state_for_inner_split)
-                    else: X_test_sampled = X_test[list_of_vars]
-                    shap_values = explainer.shap_values(X_test_sampled, check_additivity=False)
-                    _update_status(fold, n_splits, "Processing SHAP...", fold_start_time, global_start_time)
-
-                    if self.task_type == 'classification' and isinstance(shap_values, list):
-                        if self.which_class_for_shap == 'average':
-                            abs_shap_per_class = [np.abs(sv) for sv in shap_values if isinstance(sv, np.ndarray)]
-                            if not abs_shap_per_class: raise ValueError("SHAP list empty/invalid.")
-                            abs_shap_fold = np.mean(np.stack(abs_shap_per_class, axis=0), axis=0)
+                if self.importance_method == 'shap':
+                    _update_status(fold, n_splits, "Calculating SHAP...", fold_start_time, global_start_time)
+                    try:
+                        if not _shap_available or shap is None:
+                            raise ImportError("shap is not available to compute SHAP values.")
+                        explainer = shap.TreeExplainer(model)
+                        if self.sample_frac_for_shap < 1.0:
+                            X_test_sampled = X_test[list_of_vars].sample(
+                                frac=self.sample_frac_for_shap,
+                                random_state=random_state_for_inner_split
+                            )
                         else:
-                            if not isinstance(self.which_class_for_shap, int): raise ValueError("'which_class_for_shap' must be int or 'average'")
-                            if self.which_class_for_shap >= len(shap_values) or not isinstance(shap_values[self.which_class_for_shap], np.ndarray): raise IndexError("Invalid SHAP index or type")
-                            abs_shap_fold = np.abs(shap_values[self.which_class_for_shap])
-                    elif isinstance(shap_values, np.ndarray): abs_shap_fold = np.abs(shap_values)
-                    else: raise TypeError(f"Unexpected shap_values type: {type(shap_values)}")
+                            X_test_sampled = X_test[list_of_vars]
+                        shap_values = explainer.shap_values(X_test_sampled, check_additivity=False)
+                        _update_status(fold, n_splits, "Processing SHAP...", fold_start_time, global_start_time)
 
-                    if abs_shap_fold.ndim >= 1 and abs_shap_fold.shape[-1] == len(list_of_vars):
-                        mean_shap = abs_shap_fold.mean(axis=0) if abs_shap_fold.ndim == 2 else abs_shap_fold
-                        local_dict_fold_importances['abs_shap'] += mean_shap
-                    else: print(f"\n[!] Warning: Fold {fold} - SHAP shape mismatch. Skipping SHAP sum.", flush=True)
-                except Exception as e_shap_fold: print(f"\n[!] ERROR: Fold {fold} - SHAP calculation failed: {e_shap_fold}", flush=True)
-                _update_status(fold, n_splits, "SHAP calculated.", fold_start_time, global_start_time)
+                        if self.task_type == 'classification' and isinstance(shap_values, list):
+                            if self.which_class_for_shap == 'average':
+                                abs_shap_per_class = [np.abs(sv) for sv in shap_values if isinstance(sv, np.ndarray)]
+                                if not abs_shap_per_class:
+                                    raise ValueError("SHAP list empty/invalid.")
+                                abs_shap_fold = np.mean(np.stack(abs_shap_per_class, axis=0), axis=0)
+                            else:
+                                if not isinstance(self.which_class_for_shap, int):
+                                    raise ValueError("'which_class_for_shap' must be int or 'average'")
+                                if self.which_class_for_shap >= len(shap_values) or not isinstance(
+                                    shap_values[self.which_class_for_shap], np.ndarray
+                                ):
+                                    raise IndexError("Invalid SHAP index or type")
+                                abs_shap_fold = np.abs(shap_values[self.which_class_for_shap])
+                        elif isinstance(shap_values, np.ndarray):
+                            abs_shap_fold = np.abs(shap_values)
+                        else:
+                            raise TypeError(f"Unexpected shap_values type: {type(shap_values)}")
+
+                        if abs_shap_fold.ndim >= 1 and abs_shap_fold.shape[-1] == len(list_of_vars):
+                            mean_shap = abs_shap_fold.mean(axis=0) if abs_shap_fold.ndim == 2 else abs_shap_fold
+                            local_dict_fold_importances['importance'] += mean_shap
+                        else:
+                            print(f"\n[!] Warning: Fold {fold} - SHAP shape mismatch. Skipping SHAP sum.", flush=True)
+                    except Exception as e_shap_fold:
+                        print(f"\n[!] ERROR: Fold {fold} - SHAP calculation failed: {e_shap_fold}", flush=True)
+                    _update_status(fold, n_splits, "SHAP calculated.", fold_start_time, global_start_time)
+                else:
+                    _update_status(fold, n_splits, "Calculating permutation...", fold_start_time, global_start_time)
+                    try:
+                        if not np.isfinite(score_baseline):
+                            raise ValueError("Baseline score is NaN or infinite; cannot compute permutation importance.")
+                        X_test_perm = X_test[list_of_vars].copy()
+                        rng = np.random.default_rng(self.permutation_random_state)
+                        repeats = max(1, int(self.permutation_n_repeats))
+                        for feature_idx, feature_name in enumerate(list_of_vars):
+                            original_values = X_test_perm[feature_name].to_numpy().copy()
+                            diffs = []
+                            for _ in range(repeats):
+                                permuted = original_values.copy()
+                                rng.shuffle(permuted)
+                                X_test_perm[feature_name] = permuted
+                                if self.task_type == 'classification':
+                                    if hasattr(model, 'predict_proba'):
+                                        proba_perm = model.predict_proba(X_test_perm)
+                                        if proba_perm.ndim == 2 and proba_perm.shape[1] > 1:
+                                            y_pred_perm = proba_perm[:, 1]
+                                        elif proba_perm.ndim == 1:
+                                            y_pred_perm = proba_perm
+                                        else:
+                                            print(f"\n[!] Warning: Fold {fold} - Unexpected predict_proba shape during permutation for '{feature_name}': {proba_perm.shape}", flush=True)
+                                            continue
+                                    else:
+                                        y_pred_perm = model.predict(X_test_perm)
+                                else:
+                                    y_pred_perm = model.predict(X_test_perm)
+
+                                if y_pred_perm is None:
+                                    continue
+
+                                y_pred_perm_original = self.inverse_transform(y_pred_perm)
+                                try:
+                                    perm_score = self.metric(y_test, y_pred_perm_original, group_code=group_code_test)
+                                except TypeError:
+                                    perm_score = self.metric(y_test, y_pred_perm_original)
+
+                                if self.greater_is_better:
+                                    diff = score_baseline - perm_score
+                                else:
+                                    diff = perm_score - score_baseline
+
+                                if np.isfinite(diff):
+                                    diffs.append(diff)
+
+                            X_test_perm[feature_name] = original_values
+                            if diffs:
+                                local_dict_fold_importances['importance'][feature_idx] += float(np.nanmean(diffs))
+                    except Exception as e_perm:
+                        print(f"\n[!] ERROR: Fold {fold} - Permutation importance failed: {e_perm}", flush=True)
+                    _update_status(fold, n_splits, "Permutation calculated.", fold_start_time, global_start_time)
 
             except Exception as e_fold_main:
                  print(f"\n[!] ERROR processing fold {fold}: {e_fold_main}", flush=True)
@@ -353,6 +455,10 @@ class Kraken:
                 if 'X_test_sampled' in locals(): del X_test_sampled
                 if 'shap_values' in locals(): del shap_values
                 if 'abs_shap_fold' in locals(): del abs_shap_fold
+                if 'X_test_perm' in locals(): del X_test_perm
+                if 'y_pred_perm' in locals(): del y_pred_perm
+                if 'y_pred_perm_original' in locals(): del y_pred_perm_original
+                if 'y_pred_baseline_original_scale' in locals(): del y_pred_baseline_original_scale
                 del group_code_test
                 gc.collect()
 
@@ -376,9 +482,13 @@ class Kraken:
         print(f"    Mean CV Score: {bl_mean_final_display}")
         print(f"    Fold Scores: {np.round(self.baseline_fold_scores_all_features, self.comparison_precision if self.comparison_precision is not None else 2)}")
 
-        self.fe_dict = { k: v for k, v in zip(local_dict_fold_importances['Feature'], local_dict_fold_importances['abs_shap'])}
-        if np.all(local_dict_fold_importances['abs_shap'] == 0):
-             print("[get_rank_dict] Warning: All accumulated SHAP values are zero.")
+        self.fe_dict = {
+            k: v for k, v in zip(local_dict_fold_importances['Feature'], local_dict_fold_importances['importance'])
+        }
+        if np.all(local_dict_fold_importances['importance'] == 0):
+            print(
+                f"[get_rank_dict] Warning: All accumulated {self.importance_method} importances are zero."
+            )
         self.rank_dict = { k: r for r, k in enumerate(sorted(self.fe_dict, key=self.fe_dict.get, reverse=True), 1)}
         del local_dict_fold_importances; gc.collect()
         global_end_time = time.perf_counter()
@@ -387,7 +497,15 @@ class Kraken:
         if self.cache_importances and self.rank_dict:
             print("[get_rank_dict] Saving importance cache...")
             try:
-                with open(self.importances_cache_path, 'wb') as f: pickle.dump({'fe_dict': self.fe_dict, 'rank_dict': self.rank_dict}, f)
+                with open(self.importances_cache_path, 'wb') as f:
+                    pickle.dump(
+                        {
+                            'fe_dict': self.fe_dict,
+                            'rank_dict': self.rank_dict,
+                            'importance_method': self.importance_method,
+                        },
+                        f
+                    )
                 print("[get_rank_dict] Importance cache saved.")
             except Exception as e: print(f"[!] Error saving cache file: {e}")
         elif not self.rank_dict: print("[get_rank_dict] Skipping cache saving because rank_dict is empty or calculation failed.")
